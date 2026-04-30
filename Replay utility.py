@@ -2,7 +2,6 @@
 import os
 import json
 import time
-import math
 import random
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional
@@ -10,25 +9,24 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from matplotlib.patches import Circle
 
 # =========================
-# Global config for GeoLife
+# Global configuration
 # =========================
 
-GEOLIFE_ROOT = r"E:\python\Geolife Trajectories 1.3\Geolife Trajectories 1.3\Data"   # 改成你的路径
+GEOLIFE_ROOT = "path/to/Geolife/Data"
 OUT_DIR = "figures_exp3_geolife"
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ---- runtime control: keep it small enough for ~10 min ----
-MAX_USERS = None                 # e.g. 20; None = all users
-MAX_TRAJ_PER_USER = 3            # 每个用户最多抽几条
-MIN_LEN = 80                     # 至少多少个点
-MAX_LEN = 1200                   # 最多保留多少点，太长就裁掉
-TARGET_NUM_TRAJ = 60             # 总共目标轨迹数；控制运行时间
-SAVE_EVERY = 10                  # 每处理多少条保存一次中间统计
+# Runtime controls for keeping the experiment tractable
+MAX_USERS = None                 # Example: 20; None means all users
+MAX_TRAJ_PER_USER = 3            # Maximum number of trajectories sampled per user
+MIN_LEN = 80                     # Minimum trajectory length in points
+MAX_LEN = 1200                   # Maximum retained trajectory length; longer trajectories are truncated
+TARGET_NUM_TRAJ = 60             # Total number of trajectories to process
+SAVE_EVERY = 10                  # Save intermediate metadata every N processed trajectories
 
-# ---- experiment constants: match Experiment 1 as much as possible ----
+# Experiment constants aligned with Experiment 1 whenever possible
 DT = 1.0
 BUDGET_B = 6.0
 
@@ -47,12 +45,12 @@ TW_EPS_BURST = 0.12
 TAU_COOL_S = 90.0
 GEOFENCE_RADIUS_M = 30.0
 
-# Synthetic burst placement rule
+# Relative positions used to place synthetic burst windows
 BURST_RELATIVE_POSITIONS = (0.25, 0.55, 0.80)
 
-# Device capability simulation
-SCALE_L1_ONLY   = 4.0
-SCALE_L1_L5     = 2.5
+# Device capability simulation parameters
+SCALE_L1_ONLY = 4.0
+SCALE_L1_L5 = 2.5
 SCALE_L1_L5_ADR = 1.5
 NLOS_BIAS = np.array([0.8, -1.5])
 
@@ -68,6 +66,7 @@ a = 6378137.0
 f = 1 / 298.257223563
 e2 = 2 * f - f * f
 
+
 def wgs84_to_ecef(lat_deg, lon_deg, h_m):
     lat_rad = np.radians(lat_deg)
     lon_rad = np.radians(lon_deg)
@@ -76,6 +75,7 @@ def wgs84_to_ecef(lat_deg, lon_deg, h_m):
     Y = (N + h_m) * np.cos(lat_rad) * np.sin(lon_rad)
     Z = (N * (1 - e2) + h_m) * np.sin(lat_rad)
     return X, Y, Z
+
 
 def ecef_to_enu(X, Y, Z, lat0_deg, lon0_deg, h0_m):
     lat0 = np.radians(lat0_deg)
@@ -94,17 +94,19 @@ def ecef_to_enu(X, Y, Z, lat0_deg, lon0_deg, h0_m):
     t = np.array([
         [-sin_lon,             cos_lon,            0.0],
         [-sin_lat * cos_lon,  -sin_lat * sin_lon,  cos_lat],
-        [ cos_lat * cos_lon,   cos_lat * sin_lon,  sin_lat],
+        [cos_lat * cos_lon,    cos_lat * sin_lon,  sin_lat],
     ])
 
     enu = t @ np.vstack((dx, dy, dz))
     return enu[0], enu[1], enu[2]
+
 
 def latlon_to_local_enu(lat, lon, h):
     X, Y, Z = wgs84_to_ecef(lat, lon, h)
     lat0, lon0, h0 = lat[0], lon[0], h[0]
     E, N, U = ecef_to_enu(X, Y, Z, lat0, lon0, h0)
     return np.column_stack([E, N])
+
 
 # %%
 # =========================
@@ -113,9 +115,16 @@ def latlon_to_local_enu(lat, lon, h):
 
 def read_plt_file(path: str) -> Optional[pd.DataFrame]:
     """
-    GeoLife .plt format:
-    first 6 lines are header
-    then: lat, lon, zero, altitude, days, date, time
+    Read a GeoLife trajectory file in .plt format.
+
+    The first six lines are metadata headers. Each subsequent row contains:
+    latitude, longitude, zero, altitude, days, date, and time.
+
+    Returns
+    -------
+    Optional[pd.DataFrame]
+        A dataframe containing latitude, longitude, and altitude in meters,
+        or None if the file is invalid or empty.
     """
     try:
         df = pd.read_csv(
@@ -127,26 +136,38 @@ def read_plt_file(path: str) -> Optional[pd.DataFrame]:
         if df.empty:
             return None
 
-        # GeoLife altitude is often in feet; convert to meters
+        # GeoLife altitude values are typically recorded in feet.
         df["altitude_m"] = pd.to_numeric(df["altitude_ft"], errors="coerce") * 0.3048
         df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
         df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
         df = df.dropna(subset=["lat", "lon", "altitude_m"]).reset_index(drop=True)
+
         if len(df) == 0:
             return None
+
         return df[["lat", "lon", "altitude_m"]]
     except Exception:
         return None
 
+
 def collect_geolife_files(root: str) -> List[Tuple[str, str]]:
     """
-    Return list of (user_id, plt_path)
+    Collect trajectory file paths from the GeoLife directory structure.
+
+    Returns
+    -------
+    List[Tuple[str, str]]
+        A list of (user_id, plt_path) tuples.
     """
     out = []
     if not os.path.isdir(root):
         raise FileNotFoundError(f"GeoLife root not found: {root}")
 
-    user_dirs = sorted([d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))])
+    user_dirs = sorted([
+        d for d in os.listdir(root)
+        if os.path.isdir(os.path.join(root, d))
+    ])
+
     if MAX_USERS is not None:
         user_dirs = user_dirs[:MAX_USERS]
 
@@ -154,8 +175,8 @@ def collect_geolife_files(root: str) -> List[Tuple[str, str]]:
         traj_dir = os.path.join(root, user_id, "Trajectory")
         if not os.path.isdir(traj_dir):
             continue
-        files = sorted([f for f in os.listdir(traj_dir) if f.lower().endswith(".plt")])
 
+        files = sorted([f for f in os.listdir(traj_dir) if f.lower().endswith(".plt")])
         if len(files) == 0:
             continue
 
@@ -164,14 +185,27 @@ def collect_geolife_files(root: str) -> List[Tuple[str, str]]:
 
         for fn in files:
             out.append((user_id, os.path.join(traj_dir, fn)))
+
     return out
 
-def load_sampled_geolife_trajectories(root: str,
-                                      target_num: int = TARGET_NUM_TRAJ,
-                                      min_len: int = MIN_LEN,
-                                      max_len: int = MAX_LEN) -> List[Dict]:
+
+def load_sampled_geolife_trajectories(
+    root: str,
+    target_num: int = TARGET_NUM_TRAJ,
+    min_len: int = MIN_LEN,
+    max_len: int = MAX_LEN,
+) -> List[Dict]:
     """
-    Load a small subset of valid trajectories for fast experiments.
+    Load a randomly sampled subset of valid GeoLife trajectories.
+
+    The loader applies basic filtering and truncation to keep the experiment
+    computationally manageable.
+
+    Returns
+    -------
+    List[Dict]
+        A list of dictionaries containing user ID, source path, trajectory
+        length, and the local ENU representation of the trajectory.
     """
     all_files = collect_geolife_files(root)
     random.shuffle(all_files)
@@ -182,9 +216,8 @@ def load_sampled_geolife_trajectories(root: str,
         if df is None or len(df) < min_len:
             continue
 
-        # crop for speed
+        # Truncate long trajectories while preserving temporal continuity.
         if len(df) > max_len:
-            # keep prefix to preserve continuity
             df = df.iloc[:max_len].copy()
 
         x_true = latlon_to_local_enu(
@@ -193,7 +226,7 @@ def load_sampled_geolife_trajectories(root: str,
             df["altitude_m"].to_numpy()
         )
 
-        # basic sanity: remove degenerate tracks
+        # Discard degenerate or numerically invalid tracks.
         span = np.linalg.norm(x_true[-1] - x_true[0])
         if not np.isfinite(span):
             continue
@@ -210,15 +243,21 @@ def load_sampled_geolife_trajectories(root: str,
 
     return trajs
 
+
 # %%
 # ==========================
 # Capability tier simulation
 # ==========================
 
-def simulate_internal_estimate(X_t,
-                               capability: str = "L1-only",
-                               add_bias: bool = True,
-                               seed: int = 0) -> np.ndarray:
+def simulate_internal_estimate(
+    X_t,
+    capability: str = "L1-only",
+    add_bias: bool = True,
+    seed: int = 0,
+) -> np.ndarray:
+    """
+    Simulate an internal device-side position estimate for a given capability tier.
+    """
     rng = np.random.default_rng(seed)
     T, D = X_t.shape
 
@@ -235,33 +274,54 @@ def simulate_internal_estimate(X_t,
     bias = NLOS_BIAS if add_bias else 0.0
     return X_t + noise + bias
 
+
 # %%
 # ============================
 # Planar Laplace mechanism
 # ============================
 
 def planar_laplace_noise(eps: float, n: int, rng: np.random.Generator) -> np.ndarray:
+    """
+    Sample planar Laplace noise for n two-dimensional points.
+    """
     if eps <= 0:
         raise ValueError("eps must be > 0")
+
     theta = rng.uniform(0.0, 2 * np.pi, size=n)
     r = rng.gamma(shape=2.0, scale=1.0 / eps, size=n)
     dx = r * np.cos(theta)
     dy = r * np.sin(theta)
     return np.column_stack([dx, dy])
 
-def planar_laplace_release(x: np.ndarray, eps_eff: float, rng: np.random.Generator) -> np.ndarray:
+
+def planar_laplace_release(
+    x: np.ndarray,
+    eps_eff: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """
+    Apply the planar Laplace mechanism to one or more 2D points.
+    """
     x = np.asarray(x)
     if x.ndim == 1:
         return x + planar_laplace_noise(eps_eff, 1, rng)[0]
-    else:
-        return x + planar_laplace_noise(eps_eff, x.shape[0], rng)
+    return x + planar_laplace_noise(eps_eff, x.shape[0], rng)
+
 
 # %%
 # ============================
-# Utility helper functions
+# Utility helpers
 # ============================
 
-def make_intent_bursts(T: int, dt: float, burst_len_s: float = 60.0, starts: Optional[List[int]] = None):
+def make_intent_bursts(
+    T: int,
+    dt: float,
+    burst_len_s: float = 60.0,
+    starts: Optional[List[int]] = None,
+):
+    """
+    Construct a boolean mask indicating burst intervals.
+    """
     L = int(round(burst_len_s / dt))
     is_burst = np.zeros(T, dtype=bool)
 
@@ -271,21 +331,36 @@ def make_intent_bursts(T: int, dt: float, burst_len_s: float = 60.0, starts: Opt
     for s in starts:
         s = max(0, min(T - 1, s))
         is_burst[s:s + L] = True
+
     return is_burst
 
+
 def should_emit(t: int, last_emit_t: Optional[int], interval_steps: int) -> bool:
+    """
+    Determine whether a release should occur at time t based on the release cadence.
+    """
     if last_emit_t is None:
         return True
     return (t - last_emit_t) >= interval_steps
 
+
 def circle_contains(points: np.ndarray, center: np.ndarray, radius: float) -> np.ndarray:
+    """
+    Return a boolean mask indicating which points fall within a circular region.
+    """
     d = np.linalg.norm(points - center[None, :], axis=1)
     return d <= radius
 
-def compute_cooling_indicator(x_path: np.ndarray,
-                              geofences: List[Tuple[np.ndarray, float]],
-                              dt: float,
-                              tau_cool_s: float) -> np.ndarray:
+
+def compute_cooling_indicator(
+    x_path: np.ndarray,
+    geofences: List[Tuple[np.ndarray, float]],
+    dt: float,
+    tau_cool_s: float,
+) -> np.ndarray:
+    """
+    Compute the cooling-period indicator following exits from geofenced regions.
+    """
     T = x_path.shape[0]
     tau_steps = int(round(tau_cool_s / dt))
     in_any = np.zeros(T, dtype=bool)
@@ -301,7 +376,9 @@ def compute_cooling_indicator(x_path: np.ndarray,
     c_t = np.zeros(T, dtype=bool)
     for e in exit_times:
         c_t[e:e + tau_steps] = True
+
     return c_t
+
 
 # %%
 # ============================
@@ -328,13 +405,20 @@ class AuditorParams:
     gamma: float = 5.0
     alpha_max: float = 25.0
 
+
 class TwinkleAuditor:
-    def __init__(self,
-                 x_reference: np.ndarray,
-                 dt: float,
-                 geofence_centers: List[np.ndarray],
-                 params: AuditorParams,
-                 rng: np.random.Generator):
+    """
+    Privacy risk auditor used to adapt the effective privacy budget over time.
+    """
+
+    def __init__(
+        self,
+        x_reference: np.ndarray,
+        dt: float,
+        geofence_centers: List[np.ndarray],
+        params: AuditorParams,
+        rng: np.random.Generator,
+    ):
         self.dt = dt
         self.p = params
         self.rng = rng
@@ -375,7 +459,7 @@ class TwinkleAuditor:
         next_prior = np.zeros_like(prev)
 
         dmat = np.linalg.norm(self.S[:, None, :] - self.S[None, :, :], axis=2)
-        feasible = (dmat <= thr)
+        feasible = dmat <= thr
 
         for i in range(self.Ns):
             js = np.where(feasible[i])[0]
@@ -455,6 +539,9 @@ class TwinkleAuditor:
         return float(np.clip(s_star - s_bg, 0.0, 1.0))
 
     def compute_risk_and_alpha(self, t: int, z_t: Optional[np.ndarray], eps_eff: float):
+        """
+        Compute route, place, and linkage risk proxies and derive an inflation factor alpha.
+        """
         if z_t is None:
             r_route = 0.0
             r_place = self._place_risk_proxy(t)
@@ -469,7 +556,9 @@ class TwinkleAuditor:
             r_link = self._link_risk_proxy(t)
 
         wsum = self.p.w_route + self.p.w_place + self.p.w_link
-        w1, w2, w3 = self.p.w_route / wsum, self.p.w_place / wsum, self.p.w_link / wsum
+        w1 = self.p.w_route / wsum
+        w2 = self.p.w_place / wsum
+        w3 = self.p.w_link / wsum
         R = float(np.clip(w1 * r_route + w2 * r_place + w3 * r_link, 0.0, 1.0))
 
         alpha = 1.0 + self.p.gamma * max(0.0, R - self.p.risk_tau)
@@ -477,9 +566,10 @@ class TwinkleAuditor:
 
         return float(r_route), float(r_place), float(r_link), R, alpha
 
+
 # %%
 # ============================
-# Twinkle / Static GI
+# Twinkle / Static GI simulators
 # ============================
 
 @dataclass
@@ -504,6 +594,7 @@ class TwinkleParams:
 
     release_center: str = "xhat"
 
+
 @dataclass
 class StaticGIParams:
     dt: float = 1.0
@@ -512,10 +603,16 @@ class StaticGIParams:
     budget_B: float = 6.0
     release_center: str = "xhat"
 
-def simulate_static_gi(x_true: np.ndarray,
-                       x_hat: np.ndarray,
-                       params: StaticGIParams,
-                       seed: int = 0) -> pd.DataFrame:
+
+def simulate_static_gi(
+    x_true: np.ndarray,
+    x_hat: np.ndarray,
+    params: StaticGIParams,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """
+    Simulate periodic releases under the Static GI baseline.
+    """
     rng = np.random.default_rng(seed)
     T = x_true.shape[0]
     interval_steps = int(round(params.interval_s / params.dt))
@@ -550,21 +647,28 @@ def simulate_static_gi(x_true: np.ndarray,
         "budget_used": E_budget,
     })
 
-def simulate_twinkle(x_true: np.ndarray,
-                     x_hat: np.ndarray,
-                     params: TwinkleParams,
-                     seed: int = 0) -> pd.DataFrame:
+
+def simulate_twinkle(
+    x_true: np.ndarray,
+    x_hat: np.ndarray,
+    params: TwinkleParams,
+    seed: int = 0,
+) -> pd.DataFrame:
+    """
+    Simulate adaptive releases under the Twinkle mechanism.
+    """
     rng = np.random.default_rng(seed)
     T = x_true.shape[0]
     dt = params.dt
 
-    # burst schedule
+    # Construct the burst schedule.
     is_burst = make_intent_bursts(T, dt, params.burst_len_s)
 
     base_steps = int(round(params.baseline_interval_s / dt))
     burst_steps = int(round(params.burst_interval_s / dt))
 
-    # if no fixed geofence indices, place by same relative positions as burst anchors
+    # If no geofence anchors are specified, place them using the same relative
+    # positions used to define burst anchors.
     geo_idx = params.geofence_indices
     if len(geo_idx) == 0:
         geo_idx = tuple(int(r * T) for r in BURST_RELATIVE_POSITIONS[:2])
@@ -586,7 +690,7 @@ def simulate_twinkle(x_true: np.ndarray,
             dt=dt,
             geofence_centers=poi_centers if len(poi_centers) > 0 else [x_true[0]],
             params=params.auditor_params,
-            rng=rng
+            rng=rng,
         )
 
     z = np.full((T, 2), np.nan, dtype=float)
@@ -622,7 +726,9 @@ def simulate_twinkle(x_true: np.ndarray,
         if auditor is not None:
             z_prov = planar_laplace_release(x_center[t], eps_eff_t, rng)
             rr, rp, rl, R, alpha_suggested = auditor.compute_risk_and_alpha(
-                t=t, z_t=z_prov, eps_eff=eps_eff_t
+                t=t,
+                z_t=z_prov,
+                eps_eff=eps_eff_t,
             )
             r_route[t], r_place[t], r_link[t], R_total[t] = rr, rp, rl, R
             alpha_t = alpha_suggested
@@ -643,7 +749,7 @@ def simulate_twinkle(x_true: np.ndarray,
             return float(np.clip(
                 max(alpha_current, alpha_needed),
                 1.0,
-                params.auditor_params.alpha_max if params.use_auditor else 1e9
+                params.auditor_params.alpha_max if params.use_auditor else 1e9,
             ))
 
         emit = cadence_ok
@@ -669,7 +775,11 @@ def simulate_twinkle(x_true: np.ndarray,
             budget_used += eps_eff_t
 
             if auditor is not None:
-                rr, rp, rl, R, _ = auditor.compute_risk_and_alpha(t=t, z_t=z_t, eps_eff=eps_eff_t)
+                rr, rp, rl, R, _ = auditor.compute_risk_and_alpha(
+                    t=t,
+                    z_t=z_t,
+                    eps_eff=eps_eff_t,
+                )
                 r_route[t], r_place[t], r_link[t], R_total[t] = rr, rp, rl, R
 
         E_budget[t] = budget_used
@@ -692,44 +802,70 @@ def simulate_twinkle(x_true: np.ndarray,
         "R_total": R_total,
     })
 
+
 # %%
 # ============================
-# Metrics & plotting
+# Metrics and plotting
 # ============================
 
 def emission_errors(df: pd.DataFrame) -> np.ndarray:
+    """
+    Compute release-time Euclidean errors for all emitted points.
+    """
     dfe = df[df["a"] == 1].copy()
     if len(dfe) == 0:
         return np.array([])
+
     z = dfe[["zE", "zN"]].to_numpy()
     x = dfe[["xE", "xN"]].to_numpy()
     return np.linalg.norm(z - x, axis=1)
 
+
 def emission_errors_burst_only(df: pd.DataFrame) -> np.ndarray:
+    """
+    Compute release-time Euclidean errors restricted to burst intervals.
+    """
     if "mode" not in df.columns:
         return np.array([])
+
     dfe = df[(df["a"] == 1) & (df["mode"] == 1)].copy()
     if len(dfe) == 0:
         return np.array([])
+
     z = dfe[["zE", "zN"]].to_numpy()
     x = dfe[["xE", "xN"]].to_numpy()
     return np.linalg.norm(z - x, axis=1)
 
-def emission_errors_in_twinkle_bursts(df_candidate: pd.DataFrame, df_twinkle_ref: pd.DataFrame) -> np.ndarray:
+
+def emission_errors_in_twinkle_bursts(
+    df_candidate: pd.DataFrame,
+    df_twinkle_ref: pd.DataFrame,
+) -> np.ndarray:
+    """
+    Compute candidate-method errors restricted to the burst windows defined
+    by a Twinkle reference run.
+    """
     if "mode" not in df_twinkle_ref.columns:
         return np.array([])
+
     burst_idx = df_twinkle_ref.index[df_twinkle_ref["mode"] == 1]
     dfe = df_candidate.loc[burst_idx]
     dfe = dfe[dfe["a"] == 1].copy()
     if len(dfe) == 0:
         return np.array([])
+
     z = dfe[["zE", "zN"]].to_numpy()
     x = dfe[["xE", "xN"]].to_numpy()
     return np.linalg.norm(z - x, axis=1)
 
+
 def summarize_errors(err: np.ndarray) -> Dict[str, float]:
+    """
+    Summarize an error array using count, median, 95th percentile, and mean.
+    """
     if err.size == 0:
         return {"n": 0, "median": np.nan, "p95": np.nan, "mean": np.nan}
+
     return {
         "n": int(err.size),
         "median": float(np.median(err)),
@@ -737,18 +873,25 @@ def summarize_errors(err: np.ndarray) -> Dict[str, float]:
         "mean": float(np.mean(err)),
     }
 
+
 def plot_cdf(errors: Dict[str, np.ndarray], title: str, out_path: str):
+    """
+    Plot and save empirical CDF curves for multiple error distributions.
+    """
     plt.figure(figsize=(7, 5))
     for name, e in errors.items():
         e = np.asarray(e)
         if e.size == 0:
             continue
+
         e = np.sort(e)
         y = np.linspace(0, 1, e.size, endpoint=True)
         plt.plot(
-            e, y,
-            label=f"{name} (med={np.median(e):.2f}m, p95={np.quantile(e,0.95):.2f}m)"
+            e,
+            y,
+            label=f"{name} (med={np.median(e):.2f}m, p95={np.quantile(e, 0.95):.2f}m)",
         )
+
     plt.grid(True)
     plt.xlabel("Position error ||z - x|| (m)")
     plt.ylabel("CDF")
@@ -758,6 +901,7 @@ def plot_cdf(errors: Dict[str, np.ndarray], title: str, out_path: str):
     plt.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close()
 
+
 # %%
 # ============================
 # Core experiment runners
@@ -765,8 +909,14 @@ def plot_cdf(errors: Dict[str, np.ndarray], title: str, out_path: str):
 
 def run_single_traj_all_methods(x_true: np.ndarray, seed_base: int = 0):
     """
-    Match Experiment 1 settings on one GeoLife trajectory.
-    Returns dict of dataframes.
+    Run all evaluation methods on a single GeoLife trajectory using settings
+    aligned with Experiment 1.
+
+    Returns
+    -------
+    Dict
+        A dictionary containing per-method dataframes for the main comparison,
+        fixed-epsilon comparisons, and capability-aware epsilon scaling.
     """
     xhat_l1 = simulate_internal_estimate(x_true, "L1-only", seed=seed_base + 1)
     xhat_l1l5 = simulate_internal_estimate(x_true, "L1+L5", seed=seed_base + 2)
@@ -814,12 +964,13 @@ def run_single_traj_all_methods(x_true: np.ndarray, seed_base: int = 0):
         release_center="xhat",
     )
 
-    # Main comparison uses L1-only, exactly like your Exp1 section
+    # Main comparison on the L1-only tier, matching the corresponding
+    # Experiment 1 setup.
     df_static = simulate_static_gi(x_true, xhat_l1, static_params, seed=seed_base + 10)
     df_tw_no = simulate_twinkle(x_true, xhat_l1, tw_no, seed=seed_base + 11)
     df_tw_yes = simulate_twinkle(x_true, xhat_l1, tw_yes, seed=seed_base + 12)
 
-    # fixed-eps across device tiers
+    # Fixed-epsilon comparison across capability tiers.
     fixed_static = {
         "L1-only": simulate_static_gi(x_true, xhat_l1, static_params, seed=seed_base + 20),
         "L1+L5": simulate_static_gi(x_true, xhat_l1l5, static_params, seed=seed_base + 21),
@@ -832,7 +983,7 @@ def run_single_traj_all_methods(x_true: np.ndarray, seed_base: int = 0):
         "L1+L5+ADR": simulate_twinkle(x_true, xhat_l5adr, tw_yes, seed=seed_base + 32),
     }
 
-    # eps scaling across capability
+    # Capability-aware epsilon scaling.
     scales = {"L1-only": 1.0, "L1+L5": 1.5, "L1+L5+ADR": 2.0}
     scaled_tw = {}
     xhat_map = {"L1-only": xhat_l1, "L1+L5": xhat_l1l5, "L1+L5+ADR": xhat_l5adr}
@@ -855,7 +1006,12 @@ def run_single_traj_all_methods(x_true: np.ndarray, seed_base: int = 0):
             auditor_params=AuditorParams(risk_tau=0.6, gamma=5.0, alpha_max=25.0),
             release_center="xhat",
         )
-        scaled_tw[k] = simulate_twinkle(x_true, xhat_map[k], tw_scaled, seed=seed_base + 40 + len(scaled_tw))
+        scaled_tw[k] = simulate_twinkle(
+            x_true,
+            xhat_map[k],
+            tw_scaled,
+            seed=seed_base + 40 + len(scaled_tw),
+        )
 
     return {
         "main": {
@@ -868,18 +1024,26 @@ def run_single_traj_all_methods(x_true: np.ndarray, seed_base: int = 0):
         "scaled_tw": scaled_tw,
     }
 
+
 # %%
 # ============================
 # Aggregation helpers
 # ============================
 
 def append_errors(store: Dict[str, List[np.ndarray]], key: str, arr: np.ndarray):
+    """
+    Append a non-empty error array to the aggregation store.
+    """
     if key not in store:
         store[key] = []
     if arr.size > 0:
         store[key].append(arr)
 
+
 def flatten_error_store(store: Dict[str, List[np.ndarray]]) -> Dict[str, np.ndarray]:
+    """
+    Concatenate per-trajectory error arrays into a single array per method.
+    """
     out = {}
     for k, v in store.items():
         if len(v) == 0:
@@ -887,6 +1051,7 @@ def flatten_error_store(store: Dict[str, List[np.ndarray]]) -> Dict[str, np.ndar
         else:
             out[k] = np.concatenate(v, axis=0)
     return out
+
 
 # %%
 # ============================
@@ -900,15 +1065,15 @@ trajs = load_sampled_geolife_trajectories(
     GEOLIFE_ROOT,
     target_num=TARGET_NUM_TRAJ,
     min_len=MIN_LEN,
-    max_len=MAX_LEN
+    max_len=MAX_LEN,
 )
 
 print(f"Loaded {len(trajs)} GeoLife trajectories for Experiment 3.")
 
 if len(trajs) == 0:
-    raise RuntimeError("No valid trajectories found. Check GeoLife path / filters.")
+    raise RuntimeError("No valid trajectories found. Check the GeoLife path and filtering settings.")
 
-# aggregated stores
+# Aggregated error stores
 agg_main_all = {}
 agg_main_burst = {}
 agg_fixed_static = {}
@@ -921,35 +1086,36 @@ for i, tr in enumerate(trajs):
     x_true = tr["x_true"]
     res = run_single_traj_all_methods(x_true, seed_base=1000 + i * 100)
 
-    # main
+    # Main comparison
     df_static = res["main"]["Static GI"]
     df_tw_no = res["main"]["Twinkle (no auditor)"]
     df_tw_yes = res["main"]["Twinkle (auditor)"]
 
-    # all emissions
+    # All release events
     append_errors(agg_main_all, "Static GI", emission_errors(df_static))
     append_errors(agg_main_all, "Twinkle (no auditor)", emission_errors(df_tw_no))
     append_errors(agg_main_all, "Twinkle (auditor)", emission_errors(df_tw_yes))
 
-    # burst-window restricted, same as your Experiment 1b fairness version
+    # Restrict evaluation to burst windows for fair comparison with the
+    # Twinkle burst schedule.
     append_errors(agg_main_burst, "Static GI", emission_errors_in_twinkle_bursts(df_static, df_tw_no))
     append_errors(agg_main_burst, "Twinkle (no auditor)", emission_errors_in_twinkle_bursts(df_tw_no, df_tw_no))
     append_errors(agg_main_burst, "Twinkle (auditor)", emission_errors_in_twinkle_bursts(df_tw_yes, df_tw_no))
 
-    # fixed-eps static
+    # Fixed-epsilon Static GI across device tiers
     for tier, df in res["fixed_static"].items():
         append_errors(agg_fixed_static, f"Static GI ({tier})", emission_errors(df))
 
-    # fixed-eps twinkle auditor
+    # Fixed-epsilon Twinkle+Auditor across device tiers
     for tier, df in res["fixed_tw_auditor"].items():
         append_errors(agg_fixed_tw, f"Twinkle+Auditor ({tier})", emission_errors(df))
 
-    # scaled eps
+    # Capability-aware epsilon scaling
     scale_map = {"L1-only": "1.0", "L1+L5": "1.5", "L1+L5+ADR": "2.0"}
     for tier, df in res["scaled_tw"].items():
         append_errors(agg_scaled, f"Twinkle+Auditor ({tier}, eps×{scale_map[tier]})", emission_errors(df))
 
-    # per-trajectory record (方便检查)
+    # Per-trajectory metadata for debugging and traceability
     meta_rows.append({
         "traj_idx": i,
         "user_id": tr["user_id"],
@@ -961,126 +1127,130 @@ for i, tr in enumerate(trajs):
     })
 
     if (i + 1) % SAVE_EVERY == 0:
-        pd.DataFrame(meta_rows).to_csv(os.path.join(OUT_DIR, "exp3_geolife_progress_meta.csv"), index=False)
-        print(f"Processed {i+1}/{len(trajs)} trajectories ... elapsed {time.time() - start_time:.1f}s")
+        pd.DataFrame(meta_rows).to_csv(
+            os.path.join(OUT_DIR, "exp3_geolife_progress_meta.csv"),
+            index=False,
+        )
+        print(f"Processed {i + 1}/{len(trajs)} trajectories ... elapsed {time.time() - start_time:.1f}s")
 
-# flatten
+# Flatten aggregated error stores
 agg_main_all = flatten_error_store(agg_main_all)
 agg_main_burst = flatten_error_store(agg_main_burst)
 agg_fixed_static = flatten_error_store(agg_fixed_static)
 agg_fixed_tw = flatten_error_store(agg_fixed_tw)
 agg_scaled = flatten_error_store(agg_scaled)
 
+
 # %%
 # ============================
-# Plot figures (same style as Exp1)
+# Plot figures
 # ============================
 
 plot_cdf(
     agg_main_all,
     title="Experiment 3 (GeoLife) — Position error CDF at all emission times",
-    out_path=os.path.join(OUT_DIR, "exp3_cdf_l1_all_geolife.png")
+    out_path=os.path.join(OUT_DIR, "exp3_cdf_l1_all_geolife.png"),
 )
 
 plot_cdf(
     agg_main_burst,
     title="Experiment 3 (GeoLife) — Position error CDF restricted to burst windows",
-    out_path=os.path.join(OUT_DIR, "exp3_cdf_l1_burst_geolife.png")
+    out_path=os.path.join(OUT_DIR, "exp3_cdf_l1_burst_geolife.png"),
 )
 
 plot_cdf(
     agg_fixed_static,
-    title="Experiment 3 (GeoLife) — Static GI, fixed epsilon across device tiers",
-    out_path=os.path.join(OUT_DIR, "exp3_cdf_fixed_eps_staticGI_geolife.png")
+    title="Experiment 3 (GeoLife) — Static GI with fixed epsilon across device tiers",
+    out_path=os.path.join(OUT_DIR, "exp3_cdf_fixed_eps_staticGI_geolife.png"),
 )
 
 plot_cdf(
     agg_fixed_tw,
-    title="Experiment 3 (GeoLife) — Twinkle+Auditor, fixed epsilon across device tiers",
-    out_path=os.path.join(OUT_DIR, "exp3_cdf_fixed_eps_twinkleAuditor_geolife.png")
+    title="Experiment 3 (GeoLife) — Twinkle+Auditor with fixed epsilon across device tiers",
+    out_path=os.path.join(OUT_DIR, "exp3_cdf_fixed_eps_twinkleAuditor_geolife.png"),
 )
 
 plot_cdf(
     agg_scaled,
     title="Experiment 3 (GeoLife) — Twinkle+Auditor with capability-aware epsilon scaling",
-    out_path=os.path.join(OUT_DIR, "exp3_cdf_eps_scaled_across_devices_geolife.png")
+    out_path=os.path.join(OUT_DIR, "exp3_cdf_eps_scaled_across_devices_geolife.png"),
 )
+
 
 # %%
 # ============================
-# Save statistics for paper
+# Save summary statistics
 # ============================
 
 paper_rows = []
 
-# 1) main all
+# 1) Main comparison at all release times
 for name, arr in agg_main_all.items():
     s = summarize_errors(arr)
     paper_rows.append({
         "group": "l1_all",
         "method": name,
-        **s
+        **s,
     })
 
-# 2) main burst
+# 2) Main comparison restricted to burst windows
 for name, arr in agg_main_burst.items():
     s = summarize_errors(arr)
     paper_rows.append({
         "group": "l1_burst",
         "method": name,
-        **s
+        **s,
     })
 
-# 3) fixed-eps static
+# 3) Static GI with fixed epsilon
 for name, arr in agg_fixed_static.items():
     s = summarize_errors(arr)
     paper_rows.append({
         "group": "fixed_eps_static",
         "method": name,
-        **s
+        **s,
     })
 
-# 4) fixed-eps twinkle auditor
+# 4) Twinkle+Auditor with fixed epsilon
 for name, arr in agg_fixed_tw.items():
     s = summarize_errors(arr)
     paper_rows.append({
         "group": "fixed_eps_twinkle_auditor",
         "method": name,
-        **s
+        **s,
     })
 
-# 5) eps-scaled
+# 5) Capability-aware epsilon scaling
 for name, arr in agg_scaled.items():
     s = summarize_errors(arr)
     paper_rows.append({
         "group": "eps_scaled",
         "method": name,
-        **s
+        **s,
     })
 
 paper_stats_df = pd.DataFrame(paper_rows)
 paper_stats_csv = os.path.join(OUT_DIR, "exp3_geolife_paper_stats.csv")
 paper_stats_df.to_csv(paper_stats_csv, index=False)
 
-# also save json
 paper_stats_json = os.path.join(OUT_DIR, "exp3_geolife_paper_stats.json")
 with open(paper_stats_json, "w", encoding="utf-8") as f:
     json.dump(paper_rows, f, ensure_ascii=False, indent=2)
 
-# per-trajectory meta
 meta_df = pd.DataFrame(meta_rows)
 meta_df.to_csv(os.path.join(OUT_DIR, "exp3_geolife_meta.csv"), index=False)
+
 
 # %%
 # ============================
 # Console summary
 # ============================
 
-print("\n=== Paper-ready stats ===")
+print("\n=== Paper-ready statistics ===")
 print(paper_stats_df)
 
 elapsed = time.time() - start_time
-print(f"\nDone. Total elapsed: {elapsed:.1f}s")
+print(f"\nDone. Total elapsed time: {elapsed:.1f}s")
 print(f"Figures saved to: {OUT_DIR}")
-print(f"Paper stats CSV: {paper_stats_csv}")
-print(f"Paper stats JSON: {paper_stats_json}")
+print(f"Paper statistics CSV: {paper_stats_csv}")
+print(f"Paper statistics JSON: {paper_stats_json}")
