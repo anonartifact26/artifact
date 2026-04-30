@@ -1,13 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-TwinkleGPS experiment code aligned with the paper:
-- Static GI vs Twinkle vs Twinkle+Auditor for release-side utility
-- Twinkle vs Twinkle+Auditor for GeoLife HMM sequential attack
-- Baseline/burst schedule with public-intent-triggered burst windows
-- Hard global budget filter
-- Auditor chooses alpha_t and possibly suppresses releases
-- GeoLife as primary benchmark; UrbanNav optional transfer case
+Experiment code for the TwinkleGPS evaluation.
 
+This script implements:
+- Static GI vs. Twinkle vs. Twinkle+Auditor for release-side utility
+- Twinkle vs. Twinkle+Auditor under a GeoLife HMM sequential attack
+- Baseline/burst scheduling with public-intent-triggered burst windows
+- Hard global budget enforcement
+- Auditor-driven alpha_t adjustment and optional suppression
+- GeoLife as the primary benchmark, with UrbanNav as an optional transfer case
 """
 
 import os
@@ -33,21 +34,21 @@ np.random.seed(SEED)
 # -------------------------
 # Paths
 # -------------------------
-DATA_ROOT = r"E:\python\Geolife Trajectories 1.3\Geolife Trajectories 1.3\Data"
-OUTPUT_DIR = r"E:\python\HMM-photo-twinkle4"
+DATA_ROOT = "path/to/Geolife/Data"
+OUTPUT_DIR = "outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Optional UrbanNav path.
 # Expected CSV columns: time_s, lat, lon
-URBANNAV_PATH = r""  # e.g. r"E:\python\UrbanNav\urban_nav_trace.csv"
+URBANNAV_PATH = ""
 
 # =========================================================
-# Paper-aligned experimental protocol
+# Experimental protocol aligned with the paper
 # =========================================================
 
 # -------------------------
-# GeoLife data protocol
-# Paper text:
+# GeoLife preprocessing protocol
+# Consistent with the paper:
 # - retain trajectories with at least 80 samples
 # - truncate each retained trace to at most 1200 samples
 # - keep at most three trajectories per user
@@ -57,30 +58,30 @@ MAX_TRAJ_PER_USER = 3
 MIN_TOTAL_POINTS = 80
 MAX_POINTS_PER_TRAJECTORY = 1200
 
-# We split each trajectory into train/test for HMM.
+# Train/test split for the HMM attacker
 TRAIN_RATIO = 0.75
 MIN_TRAIN_POINTS = 40
 MIN_TEST_POINTS = 20
 
-# Example plots
+# Example trajectory plots
 NUM_RANDOM_EXAMPLE_USERS = 3
 EXAMPLE_MIN_TEST_POINTS = 10
 EXAMPLE_MIN_HIGH_RISK_POINTS = 8
 EXAMPLE_MAX_PLOT_POINTS = 120
 
-# Cleaning
+# Trajectory cleaning
 MIN_TIME_GAP_SEC = 0
 MAX_SPEED_MPS = 65.0
 MIN_MOVE_FOR_KEEP_M = 3.0
 
-# Grid / HMM
+# Grid / HMM configuration
 GRID_SIZE_M = 250.0
 MAX_CANDIDATE_STATES = 169
 LOCAL_SEARCH_RADIUS_CELLS = 6
 GLOBAL_FALLBACK_CANDIDATES = 40
 
 # ---------------------------------------------------------
-# Twinkle paper defaults from Section 4.1
+# Default Twinkle parameters from Section 4.1 of the paper
 # ---------------------------------------------------------
 STATIC_INTERVAL_SEC = 10.0
 STATIC_EPS = 0.06
@@ -107,7 +108,8 @@ ALPHA_MAX = 12.0
 
 HIGH_RISK_THRESHOLD = TAU
 MID_RISK_THRESHOLD = 0.45
-# Simulated device-side estimate x_hat = x + bias + heavy-tailed noise
+
+# Simulated device-side estimate: x_hat = x + bias + heavy-tailed noise
 SIM_BIAS_STD_M = 6.0
 SIM_LAPLACE_SCALE_M = 8.0
 SIM_OUTLIER_PROB = 0.08
@@ -117,14 +119,11 @@ SIM_OUTLIER_SCALE_M = 20.0
 DWELL_RADIUS_M = 80.0
 
 # Attack thresholds
-HIGH_RISK_THRESHOLD = TAU
-MID_RISK_THRESHOLD = 0.45
-
 HIT_100M = 100.0
 HIT_300M = 300.0
 HIT_500M = 500.0
 
-# Sensitivity sweeps from paper
+# Sensitivity grids reported in the paper
 SENS_BUDGETS = [2, 4, 6, 8, 10]
 SENS_TAUS = [0.4, 0.5, 0.6, 0.7, 0.8]
 
@@ -139,6 +138,9 @@ plt.rcParams["font.size"] = 10
 # =========================================================
 
 def haversine_m(lat1, lon1, lat2, lon2):
+    """
+    Compute the great-circle distance between two latitude/longitude points.
+    """
     r = 6371000.0
     p1 = math.radians(lat1)
     p2 = math.radians(lat2)
@@ -149,18 +151,27 @@ def haversine_m(lat1, lon1, lat2, lon2):
 
 
 def latlon_to_xy_m(lat, lon, lat0, lon0):
+    """
+    Convert latitude/longitude to a local planar coordinate system in meters.
+    """
     x = (lon - lon0) * 111320.0 * math.cos(math.radians(lat0))
     y = (lat - lat0) * 110540.0
     return x, y
 
 
 def xy_m_to_latlon(x, y, lat0, lon0):
+    """
+    Convert local planar coordinates in meters back to latitude/longitude.
+    """
     lat = lat0 + y / 110540.0
     lon = lon0 + x / (111320.0 * math.cos(math.radians(lat0)) + 1e-12)
     return lat, lon
 
 
 def point_to_state(point, lat0, lon0, grid_size_m):
+    """
+    Map a geographic point to a grid state.
+    """
     lat, lon = point[:2]
     x, y = latlon_to_xy_m(lat, lon, lat0, lon0)
     gx = int(round(x / grid_size_m))
@@ -169,6 +180,9 @@ def point_to_state(point, lat0, lon0, grid_size_m):
 
 
 def state_to_center_latlon(state, lat0, lon0, grid_size_m):
+    """
+    Map a grid state to the latitude/longitude of its cell center.
+    """
     gx, gy = state
     x = gx * grid_size_m
     y = gy * grid_size_m
@@ -176,6 +190,9 @@ def state_to_center_latlon(state, lat0, lon0, grid_size_m):
 
 
 def trajectory_length_m(points):
+    """
+    Compute the total trajectory length in meters.
+    """
     if len(points) < 2:
         return 0.0
     total = 0.0
@@ -185,6 +202,9 @@ def trajectory_length_m(points):
 
 
 def percentile_safe(arr, q):
+    """
+    Compute a percentile while safely handling empty or non-finite arrays.
+    """
     arr = np.asarray(arr, dtype=float)
     arr = arr[np.isfinite(arr)]
     if len(arr) == 0:
@@ -193,6 +213,9 @@ def percentile_safe(arr, q):
 
 
 def iqr_safe(arr):
+    """
+    Compute the interquartile range while safely handling empty arrays.
+    """
     arr = np.asarray(arr, dtype=float)
     arr = arr[np.isfinite(arr)]
     if len(arr) == 0:
@@ -201,6 +224,9 @@ def iqr_safe(arr):
 
 
 def median_safe(arr):
+    """
+    Compute the median while safely handling empty arrays.
+    """
     arr = np.asarray(arr, dtype=float)
     arr = arr[np.isfinite(arr)]
     if len(arr) == 0:
@@ -209,6 +235,9 @@ def median_safe(arr):
 
 
 def ensure_dir(path):
+    """
+    Create a directory if it does not already exist.
+    """
     os.makedirs(path, exist_ok=True)
 
 
@@ -217,6 +246,9 @@ def ensure_dir(path):
 # =========================================================
 
 def parse_plt_file(path):
+    """
+    Parse a GeoLife .plt file into a list of (lat, lon, timestamp) tuples.
+    """
     rows = []
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -247,6 +279,10 @@ def parse_plt_file(path):
 
 
 def preprocess_points(points):
+    """
+    Clean a trajectory by removing invalid timestamps, near-duplicates,
+    and implausibly fast transitions.
+    """
     if not points:
         return []
 
@@ -274,6 +310,9 @@ def preprocess_points(points):
 
 
 def truncate_trajectory(points, max_points):
+    """
+    Uniformly subsample a trajectory if it exceeds the maximum length.
+    """
     if len(points) <= max_points:
         return points
     idx = np.linspace(0, len(points) - 1, max_points).astype(int)
@@ -281,6 +320,9 @@ def truncate_trajectory(points, max_points):
 
 
 def load_user_trajectories(user_dir):
+    """
+    Load and preprocess all valid trajectories for a single GeoLife user.
+    """
     traj_dir = os.path.join(user_dir, "Trajectory")
     if not os.path.isdir(traj_dir):
         return []
@@ -303,6 +345,9 @@ def load_user_trajectories(user_dir):
 
 
 def split_train_test_points(points, train_ratio):
+    """
+    Split a trajectory into train and test segments for HMM evaluation.
+    """
     n = len(points)
     if n < MIN_TRAIN_POINTS + MIN_TEST_POINTS:
         return None, None
@@ -324,6 +369,10 @@ def split_train_test_points(points, train_ratio):
 
 
 def load_geolife_subset(data_root, max_users=MAX_USERS, max_traj_per_user=MAX_TRAJ_PER_USER):
+    """
+    Load a subset of GeoLife users and trajectories according to the
+    paper-aligned preprocessing protocol.
+    """
     if not os.path.isdir(data_root):
         raise FileNotFoundError(f"DATA_ROOT does not exist: {data_root}")
 
@@ -382,6 +431,8 @@ def load_geolife_subset(data_root, max_users=MAX_USERS, max_traj_per_user=MAX_TR
 
 def load_urbannav_trace(csv_path):
     """
+    Load an UrbanNav trace.
+
     Expected CSV columns:
         time_s, lat, lon
     or:
@@ -420,7 +471,9 @@ def load_urbannav_trace(csv_path):
 
 def simulate_internal_estimates(points, lat0, lon0, rng):
     """
-    x_hat_t = x_t + static bias + heavy-tailed planar noise
+    Simulate device-side estimates according to
+
+        x_hat_t = x_t + static bias + heavy-tailed planar noise
     """
     bx = rng.normal(0.0, SIM_BIAS_STD_M)
     by = rng.normal(0.0, SIM_BIAS_STD_M)
@@ -451,7 +504,9 @@ def simulate_internal_estimates(points, lat0, lon0, rng):
 # =========================================================
 
 def get_time_value(p):
-    # GeoLife point uses pandas timestamp; UrbanNav may use float seconds
+    """
+    Convert the timestamp field of a point to a numeric time value.
+    """
     ts = p[2]
     if isinstance(ts, pd.Timestamp):
         return ts.timestamp()
@@ -459,6 +514,9 @@ def get_time_value(p):
 
 
 def build_synthetic_burst_windows(points, burst_length_sec=BURST_LENGTH_SEC):
+    """
+    Build synthetic burst windows at the paper-defined relative positions.
+    """
     n = len(points)
     if n == 0:
         return []
@@ -473,6 +531,9 @@ def build_synthetic_burst_windows(points, burst_length_sec=BURST_LENGTH_SEC):
 
 
 def is_in_burst_window(time_value, windows):
+    """
+    Check whether a timestamp lies inside any burst window.
+    """
     for a, b in windows:
         if a <= time_value < b:
             return True
@@ -484,6 +545,9 @@ def is_in_burst_window(time_value, windows):
 # =========================================================
 
 def build_training_statistics(train_points_hat, lat0, lon0, grid_size_m):
+    """
+    Build basic state and transition statistics from the training trajectory.
+    """
     states = [point_to_state(p, lat0, lon0, grid_size_m) for p in train_points_hat]
     state_counts = Counter(states)
 
@@ -496,6 +560,9 @@ def build_training_statistics(train_points_hat, lat0, lon0, grid_size_m):
 
 
 def build_user_hmm(train_points_hat, lat0, lon0, grid_size_m):
+    """
+    Build the user-specific HMM representation used by the sequential attacker.
+    """
     states = [point_to_state(p, lat0, lon0, grid_size_m) for p in train_points_hat]
     state_counts = Counter(states)
     n_states = max(1, len(state_counts))
@@ -523,6 +590,10 @@ def build_user_hmm(train_points_hat, lat0, lon0, grid_size_m):
 # =========================================================
 
 def add_planar_laplace_noise(point_hat, eps_t, lat0, lon0, sensitivity_m, rng):
+    """
+    Apply planar Laplace noise to a point in local XY space and convert
+    the result back to latitude/longitude.
+    """
     lat, lon = point_hat[:2]
     x, y = latlon_to_xy_m(lat, lon, lat0, lon0)
 
@@ -539,6 +610,9 @@ def add_planar_laplace_noise(point_hat, eps_t, lat0, lon0, sensitivity_m, rng):
 # =========================================================
 
 def initialize_predictive_belief(hmm):
+    """
+    Initialize the predictive belief over HMM states.
+    """
     counts = hmm["state_counts"]
     total = sum(counts.values())
     if total <= 0:
@@ -551,6 +625,9 @@ def initialize_predictive_belief(hmm):
 
 
 def predict_belief_one_step(q_prev, hmm):
+    """
+    Advance the predictive belief by one HMM transition step.
+    """
     if not q_prev:
         return initialize_predictive_belief(hmm)
 
@@ -566,14 +643,12 @@ def predict_belief_one_step(q_prev, hmm):
         if total <= 0:
             continue
 
-        # sparse transitions
         touched = set()
         for s_cur, cnt in next_counts.items():
             prob = (cnt + alpha) / total
             q_bar[s_cur] += p_prev * prob
             touched.add(s_cur)
 
-        # small mass for unseen transitions
         residual_states = [s for s in states if s not in touched]
         if residual_states:
             prob_unseen = alpha / total
@@ -587,6 +662,10 @@ def predict_belief_one_step(q_prev, hmm):
 
 
 def posterior_update_from_release(q_bar, z_t, eps_eff, hmm, lat0, lon0):
+    """
+    Update the attacker belief using an emitted sanitized release.
+    If no release is available, return the predictive belief unchanged.
+    """
     if z_t is None:
         return q_bar
 
@@ -598,7 +677,7 @@ def posterior_update_from_release(q_bar, z_t, eps_eff, hmm, lat0, lon0):
         st_x, st_y = latlon_to_xy_m(st_lat, st_lon, lat0, lon0)
         d = math.hypot(obs_x - st_x, obs_y - st_y)
 
-        # Plug-in heuristic from paper Eq. (26)
+        # Plug-in heuristic corresponding to the paper's release-side likelihood proxy.
         ll = -max(eps_eff, MIN_EPS) * d
         scores[s] = math.log(max(prior_p, 1e-300)) + ll
 
@@ -612,11 +691,12 @@ def posterior_update_from_release(q_bar, z_t, eps_eff, hmm, lat0, lon0):
 
 def place_risk_from_sanitized_history(released_history, current_time_idx, lat0, lon0, lookback=20):
     """
-    Local-window sanitized-history dwell concentration proxy.
-    Still fully paper-compliant:
-    - uses only sanitized history
-    - causal
-    - approximates sensitive-place / dwell concentration
+    Estimate a dwell-based place-risk proxy from recent sanitized history.
+
+    This proxy remains paper-consistent in the following sense:
+    - it uses only sanitized history
+    - it is causal
+    - it approximates sensitive-place / dwell concentration
     """
     hist = [z for z in released_history[-lookback:] if z is not None]
     if len(hist) < 3:
@@ -640,22 +720,24 @@ def place_risk_from_sanitized_history(released_history, current_time_idx, lat0, 
 
 def compute_auditor_risk(q_bar, released_history, lat0, lon0):
     """
-    Composite route/place risk.
-    Paper says route-recoverability + sensitive-place exposure.
-    We operationalize this as:
+    Compute the composite route/place risk used by the auditor.
+
+    Operationalization:
     - route risk = max predictive attacker state concentration
     - place risk = sanitized-history dwell concentration
     """
     route_risk = max(q_bar.values()) if q_bar else 0.0
     place_risk = place_risk_from_sanitized_history(released_history, len(released_history), lat0, lon0)
 
-    # route + place combined
     R_t = 0.85 * route_risk + 0.15 * place_risk
     R_t = float(np.clip(R_t, 0.0, 1.0))
     return R_t, route_risk, place_risk
 
 
 def auditor_alpha_from_risk(R_t, tau=TAU, gamma=GAMMA, alpha_max=ALPHA_MAX):
+    """
+    Map the current risk value to the auditor inflation factor alpha_t.
+    """
     alpha_t = min(alpha_max, max(1.0, 1.0 + gamma * max(0.0, R_t - tau)))
     return float(alpha_t)
 
@@ -665,6 +747,9 @@ def auditor_alpha_from_risk(R_t, tau=TAU, gamma=GAMMA, alpha_max=ALPHA_MAX):
 # =========================================================
 
 def log_startprob(state, hmm):
+    """
+    Log start probability with additive smoothing.
+    """
     alpha = 1.0
     total = sum(hmm["start_counts"].values()) + alpha * hmm["n_states"]
     num = hmm["start_counts"].get(state, 0) + alpha
@@ -672,6 +757,9 @@ def log_startprob(state, hmm):
 
 
 def log_transprob(s_prev, s_cur, hmm):
+    """
+    Log transition probability with additive smoothing.
+    """
     alpha = 0.5
     next_counts = hmm["transition_counts"].get(s_prev, {})
     total = sum(next_counts.values()) + alpha * hmm["n_states"]
@@ -680,6 +768,9 @@ def log_transprob(s_prev, s_cur, hmm):
 
 
 def emission_logprob(observed_point, hidden_state, lat0, lon0, eps_t, sensitivity_m, sigma_floor=100.0):
+    """
+    Compute the emission log-probability used by the sequential attacker.
+    """
     obs_x, obs_y = latlon_to_xy_m(observed_point[0], observed_point[1], lat0, lon0)
     st_lat, st_lon = state_to_center_latlon(hidden_state, lat0, lon0, GRID_SIZE_M)
     st_x, st_y = latlon_to_xy_m(st_lat, st_lon, lat0, lon0)
@@ -690,6 +781,10 @@ def emission_logprob(observed_point, hidden_state, lat0, lon0, eps_t, sensitivit
 
 
 def candidate_states_for_observation(observed_point, hmm):
+    """
+    Restrict candidate hidden states for efficiency using a local search window
+    plus a global fallback set.
+    """
     states = hmm["states"]
     if len(states) <= MAX_CANDIDATE_STATES:
         return states
@@ -725,6 +820,9 @@ def candidate_states_for_observation(observed_point, hmm):
 
 
 def viterbi_decode(observed_points, eps_series, hmm):
+    """
+    Decode the most likely hidden-state sequence using Viterbi.
+    """
     if len(observed_points) == 0:
         return []
 
@@ -793,6 +891,9 @@ def viterbi_decode(observed_points, eps_series, hmm):
 
 
 def states_to_points(states, lat0, lon0, grid_size_m):
+    """
+    Convert a sequence of states to state-center geographic points.
+    """
     return [state_to_center_latlon(s, lat0, lon0, grid_size_m) for s in states]
 
 
@@ -801,12 +902,18 @@ def states_to_points(states, lat0, lon0, grid_size_m):
 # =========================================================
 
 def static_should_emit(last_emit_time, current_time):
+    """
+    Emission policy for the static GI baseline.
+    """
     if last_emit_time is None:
         return True
     return (current_time - last_emit_time) >= STATIC_INTERVAL_SEC
 
 
 def twinkle_mode_and_nominal_eps(current_time, burst_windows):
+    """
+    Determine the current Twinkle mode, nominal epsilon, and interval.
+    """
     in_burst = is_in_burst_window(current_time, burst_windows)
     if in_burst:
         return 1, EPS_BURST, BURST_INTERVAL_SEC
@@ -814,6 +921,9 @@ def twinkle_mode_and_nominal_eps(current_time, burst_windows):
 
 
 def twinkle_should_emit(last_emit_time, current_time, interval_sec):
+    """
+    Emission policy for Twinkle under the current schedule interval.
+    """
     if last_emit_time is None:
         return True
     return (current_time - last_emit_time) >= interval_sec
@@ -824,6 +934,9 @@ def twinkle_should_emit(last_emit_time, current_time, interval_sec):
 # =========================================================
 
 def run_static_gi_release(trace_id, true_points, hat_points, lat0, lon0, rng, budget_B=DEFAULT_BUDGET_B, burst_windows=None):
+    """
+    Run the static GI baseline under a hard global budget.
+    """
     records = []
     released_points = []
     eps_series = []
@@ -860,7 +973,7 @@ def run_static_gi_release(trace_id, true_points, hat_points, lat0, lon0, rng, bu
             "t": t,
             "time": current_time,
             "method": "Static GI",
-            "mode": 1 if in_burst else 0,  # only for reference burst membership
+            "mode": 1 if in_burst else 0,
             "candidate": int(candidate),
             "emit": int(a_t),
             "suppressed": int(candidate and not a_t),
@@ -900,6 +1013,10 @@ def run_twinkle_release(
     gamma=GAMMA,
     alpha_max=ALPHA_MAX,
 ):
+    """
+    Run Twinkle or Twinkle+Auditor under the paper-aligned scheduling,
+    risk, and budget rules.
+    """
     records = []
     released_points = []
     eps_series = []
@@ -908,7 +1025,6 @@ def run_twinkle_release(
     cum_budget = 0.0
     last_emit_time = None
 
-    # sanitized-history-only auditor state
     released_history = []
     q_prev = initialize_predictive_belief(hmm)
 
@@ -932,19 +1048,14 @@ def run_twinkle_release(
                 alpha_t = auditor_alpha_from_risk(R_t, tau=tau, gamma=gamma, alpha_max=alpha_max)
                 eps_eff_try = max(MIN_EPS, eps_nom / alpha_t)
 
-                # hard risk shutdown
                 if R_t > tau_hard:
                     a_t = 0
                     suppressed = 1
                 else:
-                    # budget filter: first try current alpha;
-                    # if budget fails, increase alpha up to alpha_max;
-                    # if still fails, suppress.
                     if cum_budget + eps_eff_try <= budget_B:
                         a_t = 1
                         eps_eff = eps_eff_try
                     else:
-                        # additional inflation to fit remaining budget
                         remain = budget_B - cum_budget
                         if remain > 0:
                             alpha_need = eps_nom / max(remain, MIN_EPS)
@@ -978,8 +1089,14 @@ def run_twinkle_release(
                 cum_budget += eps_eff
                 last_emit_time = current_time
 
-        # update posterior only from sanitized release / suppression
-        q_prev = posterior_update_from_release(q_bar, y_t, eps_eff if np.isfinite(eps_eff) else eps_nom, hmm, lat0, lon0)
+        q_prev = posterior_update_from_release(
+            q_bar,
+            y_t,
+            eps_eff if np.isfinite(eps_eff) else eps_nom,
+            hmm,
+            lat0,
+            lon0,
+        )
         released_history.append(y_t)
 
         rel_err = haversine_m(true_p[0], true_p[1], y_t[0], y_t[1]) if y_t is not None else np.nan
@@ -1022,14 +1139,23 @@ def run_twinkle_release(
 
 def evaluate_attack(trace_id, variant_name, emitted_true_hat_points, released_points, eps_series, hmm, lat0, lon0, release_df):
     """
-    emitted_true_hat_points: list of tuples (true_point, hat_point, original_t)
-    Only emitted points are attack-evaluated, consistent with paper wording.
+    Evaluate the sequential attacker on emitted releases only.
+
+    Parameters
+    ----------
+    emitted_true_hat_points : list
+        Tuples of the form (true_point, hat_point, original_t).
+
+    Notes
+    -----
+    Attack evaluation is restricted to emitted timestamps, consistent with
+    the evaluation protocol described in the paper.
     """
     if len(released_points) == 0:
         return pd.DataFrame(), []
 
     true_hat_points = emitted_true_hat_points
-    true_hat_only = [x[1] for x in true_hat_points]  # x_hat_t for exact-state comparison
+    true_hat_only = [x[1] for x in true_hat_points]
     true_points = [x[0] for x in true_hat_points]
     orig_t_list = [x[2] for x in true_hat_points]
 
@@ -1089,6 +1215,9 @@ def evaluate_attack(trace_id, variant_name, emitted_true_hat_points, released_po
 # =========================================================
 
 def summarize_release_errors_for_method(df_method, scope):
+    """
+    Summarize release error statistics for one method under the requested scope.
+    """
     if scope == "All":
         sub = df_method[df_method["emit"] == 1]
     elif scope == "Burst":
@@ -1105,6 +1234,9 @@ def summarize_release_errors_for_method(df_method, scope):
 
 
 def make_geolife_release_summary(release_all_df):
+    """
+    Create the release-side utility summary table for GeoLife.
+    """
     rows = []
     for scope in ["All", "Burst"]:
         for method in ["Static GI", "Twinkle", "Twinkle+Auditor"]:
@@ -1121,6 +1253,10 @@ def make_geolife_release_summary(release_all_df):
 
 
 def make_attack_summary_table(attack_df, release_df_twinkle, release_df_aud):
+    """
+    Create the aggregate attack summary table comparing Twinkle and
+    Twinkle+Auditor.
+    """
     rows = []
 
     def add_block(subset_name, df_no, df_wi):
@@ -1169,6 +1305,9 @@ def make_attack_summary_table(attack_df, release_df_twinkle, release_df_aud):
 def run_single_trace_for_sensitivity(
     true_points, hat_points, lat0, lon0, burst_windows, hmm, rng_seed, budget_B=DEFAULT_BUDGET_B, tau=TAU
 ):
+    """
+    Run a single trace for the sensitivity analysis.
+    """
     rng = np.random.default_rng(rng_seed)
     release_df, _, _, _ = run_twinkle_release(
         trace_id="sens",
@@ -1209,6 +1348,9 @@ def run_single_trace_for_sensitivity(
 # =========================================================
 
 def plot_cdf(ax, arr, label):
+    """
+    Plot a CDF from a one-dimensional numeric array.
+    """
     arr = np.asarray(arr, dtype=float)
     arr = arr[np.isfinite(arr)]
     if len(arr) == 0:
@@ -1219,12 +1361,18 @@ def plot_cdf(ax, arr, label):
 
 
 def label_with_stats(name, arr):
+    """
+    Create a legend label with median and p95 summary statistics.
+    """
     med = median_safe(arr)
     p95 = percentile_safe(arr, 95)
     return f"{name} (med={med:.2f}m, p95={p95:.2f}m)"
 
 
 def plot_geolife_utility_cdfs(release_df, output_dir):
+    """
+    Plot GeoLife utility CDFs for all emission times and burst-only emissions.
+    """
     ensure_dir(output_dir)
 
     fig, ax = plt.subplots(figsize=(7, 5))
@@ -1257,6 +1405,9 @@ def plot_geolife_utility_cdfs(release_df, output_dir):
 
 
 def plot_urbannav_utility_cdfs(release_df, output_dir):
+    """
+    Plot UrbanNav utility CDFs if an UrbanNav evaluation is available.
+    """
     if release_df is None or len(release_df) == 0:
         print("[PLOT] UrbanNav utility CDF skipped: no UrbanNav data.")
         return
@@ -1293,10 +1444,13 @@ def plot_urbannav_utility_cdfs(release_df, output_dir):
 
 
 # =========================================================
-# Plotting: attack figures (paper Fig. 2 / 3)
+# Plotting: attack figures
 # =========================================================
 
 def plot_overall_attack_bars(attack_df, output_dir):
+    """
+    Plot overall attack success rates for Twinkle and Twinkle+Auditor.
+    """
     metrics = ["exact", "hit_100m", "hit_300m", "hit_500m"]
     labels = ["Exact", "Hit@100m", "Hit@300m", "Hit@500m"]
 
@@ -1324,6 +1478,9 @@ def plot_overall_attack_bars(attack_df, output_dir):
 
 
 def plot_highrisk_attack_bars(attack_df, output_dir):
+    """
+    Plot attack success rates restricted to high-risk timestamps.
+    """
     high_df = attack_df[attack_df["high_risk"] == 1]
 
     metrics = ["exact", "hit_100m", "hit_300m", "hit_500m"]
@@ -1353,6 +1510,9 @@ def plot_highrisk_attack_bars(attack_df, output_dir):
 
 
 def plot_recovery_error_boxplots(attack_df, output_dir):
+    """
+    Plot attacker reconstruction error boxplots for overall and high-risk subsets.
+    """
     fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
 
     overall_no = attack_df[attack_df["variant"] == "Twinkle"]["recover_error"].dropna().values
@@ -1378,6 +1538,9 @@ def plot_recovery_error_boxplots(attack_df, output_dir):
 
 
 def plot_release_error_boxplots(release_twinkle_df, release_twinkle_aud_df, output_dir):
+    """
+    Plot release error boxplots for Twinkle and Twinkle+Auditor.
+    """
     plt.figure(figsize=(8, 5))
     data = [
         release_twinkle_df[release_twinkle_df["emit"] == 1]["release_error"].dropna().values,
@@ -1392,10 +1555,13 @@ def plot_release_error_boxplots(release_twinkle_df, release_twinkle_aud_df, outp
 
 
 # =========================================================
-# Plotting: sensitivity (paper Fig. 4)
+# Plotting: sensitivity
 # =========================================================
 
 def plot_sensitivity_budget(df_budget, output_dir):
+    """
+    Plot sensitivity trends as the global budget B is varied.
+    """
     plt.figure(figsize=(8, 6))
     x = df_budget["B"].values
 
@@ -1414,6 +1580,9 @@ def plot_sensitivity_budget(df_budget, output_dir):
 
 
 def plot_sensitivity_tau(df_tau, output_dir):
+    """
+    Plot sensitivity trends as the auditor threshold tau is varied.
+    """
     plt.figure(figsize=(8, 6))
     x = df_tau["tau"].values
 
@@ -1432,10 +1601,13 @@ def plot_sensitivity_tau(df_tau, output_dir):
 
 
 # =========================================================
-# Plotting: UrbanNav case study (paper Fig. 5)
+# Plotting: UrbanNav case study
 # =========================================================
 
 def plot_urbannav_case_study(release_df, output_dir):
+    """
+    Plot the UrbanNav transfer-case figures if UrbanNav results are available.
+    """
     if release_df is None or len(release_df) == 0:
         print("[PLOT] UrbanNav case study skipped: no UrbanNav data.")
         return
@@ -1485,6 +1657,10 @@ def plot_urbannav_case_study(release_df, output_dir):
 # =========================================================
 
 def plot_example_trajectory(trace_id, true_points, release_tw_df, release_aud_df, attack_tw_df, attack_aud_df, output_dir, max_plot_points=120):
+    """
+    Plot one example trajectory with true path, sanitized releases, and
+    attacker reconstructions.
+    """
     n = min(max_plot_points, len(true_points))
     if n <= 5:
         return
@@ -1529,6 +1705,9 @@ def plot_example_trajectory(trace_id, true_points, release_tw_df, release_aud_df
 # =========================================================
 
 def run_geolife_main_experiment():
+    """
+    Run the main GeoLife experiment pipeline.
+    """
     flat_traces = load_geolife_subset(DATA_ROOT, MAX_USERS, MAX_TRAJ_PER_USER)
     if len(flat_traces) == 0:
         raise RuntimeError("No valid GeoLife trajectories found.")
@@ -1555,24 +1734,20 @@ def run_geolife_main_experiment():
         hmm = build_user_hmm(train_hat, lat0, lon0, GRID_SIZE_M)
         burst_windows = build_synthetic_burst_windows(test_points, BURST_LENGTH_SEC)
 
-        # Static GI
         static_df, static_rels, static_eps, static_true_emit = run_static_gi_release(
             trace_id, test_points, test_hat, lat0, lon0, rng, DEFAULT_BUDGET_B, burst_windows
         )
 
-        # Twinkle
         tw_df, tw_rels, tw_eps, tw_true_emit = run_twinkle_release(
             trace_id, test_points, test_hat, lat0, lon0, rng, hmm, burst_windows,
             budget_B=DEFAULT_BUDGET_B, with_auditor=False
         )
 
-        # Twinkle + Auditor
         aud_df, aud_rels, aud_eps, aud_true_emit = run_twinkle_release(
             trace_id, test_points, test_hat, lat0, lon0, rng, hmm, burst_windows,
             budget_B=DEFAULT_BUDGET_B, with_auditor=True
         )
 
-        # Attach emitted point mappings for attack
         tw_emit_idx = tw_df[tw_df["emit"] == 1]["t"].tolist()
         aud_emit_idx = aud_df[aud_df["emit"] == 1]["t"].tolist()
 
@@ -1601,15 +1776,12 @@ def run_geolife_main_experiment():
     release_all_df = pd.concat(all_release, ignore_index=True)
     attack_all_df = pd.concat(all_attack, ignore_index=True)
 
-    # Main utility table for GeoLife
     geolife_release_summary = make_geolife_release_summary(release_all_df)
 
-    # Main attack table
     release_tw = release_all_df[release_all_df["method"] == "Twinkle"].copy()
     release_aud = release_all_df[release_all_df["method"] == "Twinkle+Auditor"].copy()
     attack_summary = make_attack_summary_table(attack_all_df, release_tw, release_aud)
 
-    # Example payloads
     example_payloads = []
     if len(example_candidates) > 0:
         rng_examples = random.Random(SEED + 999)
@@ -1628,13 +1800,14 @@ def run_geolife_main_experiment():
 
 
 def run_geolife_sensitivity(flat_traces):
+    """
+    Run the GeoLife sensitivity analysis for budget B and threshold tau.
+    """
     budget_rows = []
     tau_rows = []
 
-    # Use up to first 75 traces if available, per paper wording
     sens_traces = flat_traces[:75]
 
-    # Panel A: vary B, fixed tau=0.6
     for B in SENS_BUDGETS:
         vals = []
         for idx, (trace_id, uid, tr) in enumerate(sens_traces, 1):
@@ -1663,7 +1836,6 @@ def run_geolife_sensitivity(flat_traces):
             "p95_err": np.nanmean([v["p95_err"] for v in vals]),
         })
 
-    # Panel B: vary tau, fixed B=6
     for tau in SENS_TAUS:
         vals = []
         for idx, (trace_id, uid, tr) in enumerate(sens_traces, 1):
@@ -1696,6 +1868,9 @@ def run_geolife_sensitivity(flat_traces):
 
 
 def run_optional_urbannav_experiment():
+    """
+    Run the optional UrbanNav transfer-case experiment.
+    """
     rows = load_urbannav_trace(URBANNAV_PATH)
     if rows is None:
         return None
@@ -1706,8 +1881,6 @@ def run_optional_urbannav_experiment():
     lon0 = rows[0][1]
     rng = np.random.default_rng(SEED + 123456)
 
-    # For UrbanNav we treat the whole trace as evaluation trace;
-    # HMM training here uses first 50% just to instantiate the attacker state model.
     n = len(rows)
     if n < 40:
         print("[WARN] UrbanNav trace too short, skipping.")
@@ -1744,6 +1917,9 @@ def run_optional_urbannav_experiment():
 # =========================================================
 
 def save_pretty_csv(df, path, round_cols=True):
+    """
+    Save a dataframe to CSV with optional rounding for floating-point columns.
+    """
     out = df.copy()
     if round_cols:
         for c in out.columns:
@@ -1765,12 +1941,12 @@ def main():
         print("=" * 80)
 
         # -------------------------
-        # GeoLife main only
+        # GeoLife main experiment
         # -------------------------
         release_all_df, attack_all_df, geolife_release_summary, attack_summary, example_payloads, flat_traces = run_geolife_main_experiment()
 
         # -------------------------
-        # Save CSVs
+        # Save CSV outputs
         # -------------------------
         save_pretty_csv(
             release_all_df,
@@ -1790,7 +1966,7 @@ def main():
         )
 
         # -------------------------
-        # Plots: GeoLife utility
+        # GeoLife utility plots
         # -------------------------
         print("[PLOT] GeoLife utility CDFs...")
         plot_geolife_utility_cdfs(release_all_df, OUTPUT_DIR)
@@ -1809,8 +1985,8 @@ def main():
         plot_release_error_boxplots(release_tw, release_aud, OUTPUT_DIR)
 
         # -------------------------
-        # Optional example trajectories
-        # Comment this block out too if you want even faster runs
+        # Optional example trajectory plots
+        # This block can be disabled for shorter runtimes
         # -------------------------
         print("[PLOT] Example trajectory figures...")
         for payload in example_payloads:
@@ -1839,8 +2015,8 @@ def main():
         print("=" * 80)
         print(attack_summary.round(3).to_string(index=False))
 
-        print("\n[INFO] Sensitivity analysis skipped in this fast run.")
-        print("[INFO] UrbanNav experiment skipped in this fast run.")
+        print("\n[INFO] Sensitivity analysis is not executed in the default lightweight run.")
+        print("[INFO] UrbanNav evaluation is not executed in the default lightweight run.")
 
         print("\n" + "=" * 80)
         print(f"All results saved to: {OUTPUT_DIR}")
