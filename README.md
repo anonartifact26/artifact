@@ -1,6 +1,7 @@
+
 # TwinkleGPS
 
-This repository contains the experimental code for the paper on **TwinkleGPS**, including real-trace replay, replay utility evaluation, sequential trajectory recovery, and sensitivity analysis.
+This repository contains the experimental code for the paper on **TwinkleGPS**, including **main real-device deployment**, **GeoLife real-trace replay**, **replay utility evaluation**, **sequential trajectory recovery**, and **sensitivity analysis**.
 
 The experiments in the paper are organized in the following order:
 
@@ -10,7 +11,7 @@ The experiments in the paper are organized in the following order:
 4. **Sequential trajectory recovery**
 5. **Sensitivity**
 
-At the current stage, this repository includes code for Experiments 2--5. The section for **Main real-device deployment** is intentionally left as a placeholder and will be completed later.
+At the current stage, this repository includes runnable code for **Experiments 2--5**. The code and data for **Main real-device deployment** are organized locally as **`Main real-device deployment code`** and **`data/experiment/data`**, and the README below reflects that naming.
 
 ---
 
@@ -19,40 +20,42 @@ At the current stage, this repository includes code for Experiments 2--5. The se
 1. Download the **GeoLife GPS Trajectories** dataset from the official source.
 2. Extract it locally so that the directory structure looks like:
 
-```text
-GeoLife/
-└── Data/
-    ├── 000/
-    │   └── Trajectory/
-    │       ├── *.plt
-    │       └── ...
-    ├── 001/
-    │   └── Trajectory/
-    │       └── ...
-    └── ...
-```
+    ```text
+    GeoLife/
+    └── Data/
+        ├── 000/
+        │   └── Trajectory/
+        │       ├── *.plt
+        │       └── ...
+        ├── 001/
+        │   └── Trajectory/
+        │       └── ...
+        └── ...
+    ```
 
 3. In the relevant scripts, replace:
 
-```python
-"path/to/Geolife/Data"
-```
+    ```python
+    "path/to/Geolife/Data"
+    ```
 
-with your local GeoLife path.
+    with your local GeoLife path.
 
 4. Install dependencies:
 
-```bash
-pip install -r requirements.txt
-```
+    ```bash
+    pip install -r requirements.txt
+    ```
 
 5. Run the desired experiment:
 
-```bash
-python "Replay utility.py"
-python "Sequential trajectory recovery.py"
-python "Sensitivity.py"
-```
+    ```bash
+    python "Main real-device deployment code"
+    python "GeoLife real-trace replay.py"
+    python "Replay utility.py"
+    python "Sequential trajectory recovery.py"
+    python "Sensitivity.py"
+    ```
 
 ---
 
@@ -60,16 +63,18 @@ python "Sensitivity.py"
 
 This repository is intended to support the main experimental results reported in the paper.
 
-Currently included:
+### Currently included
 
+- Main real-device deployment code
 - GeoLife-based real-trace replay
 - Release-side utility evaluation
 - Sequential trajectory recovery under a user-specific attacker
 - Sensitivity analysis for key Twinkle+Auditor parameters
 
-Not yet included:
+### Current release status
 
-- Full release package for **Main real-device deployment**
+- **Experiment 1** is documented in this README and corresponds to the local code and data organization used in this project.
+- **Experiments 2--5** are implemented in the current repository and can be run after local path configuration.
 
 ---
 
@@ -82,11 +87,14 @@ TwinkleGPS/
 ├── README.md
 ├── requirements.txt
 ├── .gitignore
-├── Main real-device deployment.py
+├── Main real-device deployment code
 ├── GeoLife real-trace replay.py
 ├── Replay utility.py
 ├── Sequential trajectory recovery.py
 ├── Sensitivity.py
+├── data/
+│   └── experiment/
+│       └── data/
 ├── outputs/
 ├── figures_exp3_geolife/
 └── sensitivity_results_paper_consistent/
@@ -98,7 +106,7 @@ The GeoLife dataset is **not included** in this repository.
 
 ## Installation
 
-We recommend using Python 3.10 or later.
+We recommend using **Python 3.10 or later**.
 
 Install the required packages with:
 
@@ -112,13 +120,50 @@ The current code mainly depends on:
 - `pandas`
 - `matplotlib`
 
+Depending on the exact local environment and script version, additional standard scientific Python packages may also be required.
+
 ---
 
 ## Dataset
 
-This repository uses the **GeoLife GPS Trajectories** dataset for the replay-based experiments.
+This repository uses two types of data:
 
-The dataset is **not redistributed** in this repository. Please download it from the official source and place it locally before running the code.
+1. **Real-device deployment data** for **Experiment 1**
+2. **GeoLife GPS Trajectories** for **Experiments 2--5**
+
+### Real-device deployment data
+
+The local data directory for the main real-device deployment experiment is:
+
+```text
+data/experiment/data
+```
+
+This directory is intended to store the real-device walking logs used in **Experiment 1**.
+
+A typical structure may look like:
+
+```text
+data/
+└── experiment/
+    └── data/
+        ├── order1/
+        │   ├── baseline.xlsx
+        │   ├── burst.xlsx
+        │   └── gps.xlsx
+        ├── order2/
+        │   ├── baseline.xlsx
+        │   ├── burst.xlsx
+        │   └── gps.xlsx
+        └── order3/
+            ├── baseline.xlsx
+            ├── burst.xlsx
+            └── gps.xlsx
+```
+
+### GeoLife dataset
+
+The GeoLife dataset is **not included** in this repository. Please download it from the official source and place it locally before running the replay-based code.
 
 Expected directory structure:
 
@@ -147,9 +192,158 @@ That is, the path should refer directly to the `Data` directory.
 
 ## Experiment 1: Main real-device deployment
 
-> **Placeholder**
->
-> The code, dataset description, device setup, and reproduction instructions for this experiment will be added later.
+This experiment corresponds to the **main on-device evaluation** of TwinkleGPS under real walking traces collected from actual mobile devices.
+
+### Code and data names used in this project
+
+The local code file for this experiment is:
+
+```text
+Main real-device deployment code
+```
+
+The local data directory for this experiment is:
+
+```text
+data/experiment/data
+```
+
+### Purpose
+
+The goal of this experiment is to evaluate how TwinkleGPS behaves in a real deployment setting rather than in replay only. In particular, this experiment is intended to compare utility and energy behavior under practical device-side execution.
+
+### Compared profiles
+
+The real-device experiment uses the following profiles:
+
+- **baseline**
+- **burst**
+- **gps**
+
+A typical interpretation is:
+
+- **baseline**: the baseline Twinkle-style release configuration during normal operation
+- **burst**: a higher-frequency release configuration during public-intent or burst periods
+- **gps**: a GPS-based reference run used as the comparison path or ground-truth-like trajectory reference
+
+### Experimental organization
+
+The real-device deployment is organized by repeated run orders, typically such as:
+
+- `order1`
+- `order2`
+- `order3`
+
+For each order, the experiment records outputs for the different profiles listed above.
+
+### Input data format
+
+The experiment is designed around structured Excel logs collected during real-device runs. Typical files are organized under directories such as:
+
+```text
+data/
+└── experiment/
+    └── data/
+        ├── order1/
+        │   ├── baseline.xlsx
+        │   ├── burst.xlsx
+        │   └── gps.xlsx
+        ├── order2/
+        │   ├── baseline.xlsx
+        │   ├── burst.xlsx
+        │   └── gps.xlsx
+        └── order3/
+            ├── baseline.xlsx
+            ├── burst.xlsx
+            └── gps.xlsx
+```
+
+Some setups may alternatively store each profile in a subdirectory containing one or more Excel files. In that case, the analysis code typically selects the main Excel file from the corresponding folder.
+
+### Typical logged fields
+
+The real-device logs may include columns such as:
+
+- `timestamp`
+- `elapsed_ms`
+- `event`
+- `mode`
+- `intent`
+- `raw_provider`
+- `raw_lat`
+- `raw_lon`
+- `raw_accuracy_m`
+- `released_lat`
+- `released_lon`
+- `release_offset_m`
+- `epsilon_used`
+- `release_triggered`
+- `raw_update_count`
+- `release_count`
+- `gps_reference_count`
+- `battery_pct`
+- `is_charging`
+- `charge_plug`
+- `device`
+- `android_version`
+- `note`
+
+These fields support downstream analysis of release behavior, path error, and battery consumption.
+
+### Main evaluation dimensions
+
+This experiment is intended to support the following real-device analyses:
+
+- trajectory utility relative to the GPS reference
+- release behavior under different profiles
+- battery consumption during real runs
+- qualitative and quantitative comparison between baseline and burst behavior
+
+### Typical metrics
+
+The real-device deployment analysis typically focuses on:
+
+- path error relative to the GPS reference path
+- per-release spatial error
+- start battery level
+- end battery level
+- total battery drop
+- experiment duration
+- estimated battery drain rate per hour
+
+### Expected outputs
+
+Typical outputs for the real-device deployment may include:
+
+- summary CSV tables
+- per-order profile comparisons
+- path visualizations
+- battery comparison plots
+- PNG and PDF figures for reporting
+
+If an analysis script is used for this experiment, outputs are typically written to a directory such as:
+
+```text
+outputs/walking/
+```
+
+### How to run
+
+If the code file is named exactly as below in your local project, run:
+
+```bash
+python "Main real-device deployment code"
+```
+
+If the script requires local path variables, make sure they point to:
+
+```text
+data/experiment/data
+```
+
+### Notes
+
+This experiment appears first in the paper because it reflects the main deployment setting.
 
 ---
 
@@ -179,7 +373,7 @@ Across the replay-based experiments, the code follows the paper-aligned preproce
 
 - retain trajectories with at least **80 samples**
 - truncate retained trajectories to at most **1200 samples**
-- keep at most **3 trajectories per user** where applicable
+- keep at most **3 trajectories per user**, where applicable
 
 The replay utility code additionally samples a target number of trajectories for tractability.
 
@@ -187,9 +381,9 @@ The replay utility code additionally samples a target number of trajectories for
 
 The replay setup places synthetic burst windows at relative trajectory positions:
 
-- 25%
-- 55%
-- 80%
+- **25%**
+- **55%**
+- **80%**
 
 Each burst window has duration:
 
@@ -535,6 +729,14 @@ The GeoLife dataset is **not included** in this repository.
 
 Please download it separately from the official source and place it on your local machine. This repository only contains the code used to process and evaluate the traces.
 
+The local real-device deployment data for **Experiment 1** is organized under:
+
+```text
+data/experiment/data
+```
+
+If you plan to share this repository publicly, you may choose whether to include or exclude that directory depending on your data release policy.
+
 ---
 
 ## Reproducibility notes
@@ -550,6 +752,8 @@ However, exact numerical values may still vary slightly depending on:
 - operating system
 - local file ordering or sampling conditions if the dataset layout changes
 
+For **Experiment 1**, exact reproducibility additionally depends on the availability of real-device logs, device configuration, and deployment protocol details.
+
 ---
 
 ## Minimal usage checklist
@@ -558,16 +762,28 @@ Before running the experiments:
 
 1. download the GeoLife dataset
 2. extract it locally
-3. make sure the directory looks like `.../Geolife/Data/<user_id>/Trajectory/*.plt`
+3. make sure the directory looks like `.../GeoLife/Data/<user_id>/Trajectory/*.plt`
 4. update the path strings in the scripts from:
 
-```python
-"path/to/Geolife/Data"
-```
+    ```python
+    "path/to/Geolife/Data"
+    ```
 
-to your actual local path
+    to your actual local path
 5. install the dependencies in `requirements.txt`
 6. run the desired experiment script
+
+If you plan to run **Experiment 1**, also make sure your local real-device data is placed under:
+
+```text
+data/experiment/data
+```
+
+and that the corresponding script file is named:
+
+```text
+Main real-device deployment code
+```
 
 ---
 
@@ -578,7 +794,3 @@ If you use this code, please cite the corresponding paper.
 > Citation details will be added after the paper metadata is finalized.
 
 ---
-
-## Contact
-
-For questions about the code or reproduction details, please open an issue or contact the authors.
