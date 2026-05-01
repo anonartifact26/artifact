@@ -1,0 +1,1312 @@
+"""
+Analysis script for the walking dataset.
+
+This script:
+1. loads Excel files for each run and profile,
+2. computes battery and path-error metrics,
+3. exports summary tables, and
+4. generates figures.
+
+Expected repository structure:
+repo/
+├── data/
+│   └── walking/
+│       ├── order1/
+│       ├── order2/
+│       └── order3/
+├── scripts/
+│   └── analyze_walking.py
+└── outputs/
+"""
+
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+
+
+# =========================================================
+# 0. Configuration
+# =========================================================
+
+ROOT = Path(__file__).resolve().parents[1] / "data" / "walking"
+ORDERS = ["order1", "order2", "order3"]
+PROFILES = ["baseline", "burst", "gps"]
+EVAL_PROFILES = ["baseline", "burst"]
+
+OUT_DIR = Path(__file__).resolve().parents[1] / "outputs" / "walking"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+COLORS = {
+    "baseline": "#A97142",
+    "burst": "#1F77B4",
+    "gps": "#2CA25F",
+    "gt": "#D62728",
+    "order1": "#C44E52",
+    "order2": "#55A868",
+    "order3": "#8172B2",
+    "grid": "#D9D9D9",
+    "text": "#1A1A1A",
+    "light_gray": "#ECECEC",
+    "violin_baseline": "#D6D6D6",
+    "violin_burst": "#C7D7E8",
+}
+
+plt.rcParams.update({
+    "figure.dpi": 180,
+    "savefig.dpi": 500,
+    "font.family": "DejaVu Sans",
+
+    "font.size": 11,
+    "font.weight": "bold",
+
+    "axes.titlesize": 14,
+    "axes.titleweight": "bold",
+    "axes.labelsize": 12,
+    "axes.labelweight": "bold",
+
+    "xtick.labelsize": 10.5,
+    "ytick.labelsize": 10.5,
+
+    "legend.fontsize": 10.5,
+    "legend.frameon": False,
+
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.linewidth": 0.9,
+
+    "axes.grid": False,
+    "grid.color": COLORS["grid"],
+    "grid.alpha": 0.35,
+    "grid.linewidth": 0.8,
+
+    "lines.linewidth": 2.0,
+})
+
+SAVEFIG_KW = dict(
+    bbox_inches="tight",
+    pad_inches=0.04,
+    facecolor="white",
+    edgecolor="white"
+)
+
+ONLY_RELEASED_POINTS = True
+
+
+# =========================================================
+# 1. Utilities
+# =========================================================
+
+def make_all_text_bold(ax):
+    ax.title.set_fontweight("bold")
+    ax.xaxis.label.set_fontweight("bold")
+    ax.yaxis.label.set_fontweight("bold")
+
+    for t in ax.get_xticklabels():
+        t.set_fontweight("bold")
+    for t in ax.get_yticklabels():
+        t.set_fontweight("bold")
+
+    leg = ax.get_legend()
+    if leg is not None:
+        for txt in leg.get_texts():
+            txt.set_fontweight("bold")
+
+
+def style_axis(ax, ygrid=True):
+    ax.spines["left"].set_color("#444444")
+    ax.spines["bottom"].set_color("#444444")
+    ax.spines["left"].set_linewidth(0.9)
+    ax.spines["bottom"].set_linewidth(0.9)
+    ax.tick_params(axis="both", width=0.8, length=3.5, color="#444444")
+
+    if ygrid:
+        ax.grid(axis="y", color=COLORS["grid"], alpha=0.55, linewidth=0.8)
+        ax.set_axisbelow(True)
+
+    make_all_text_bold(ax)
+
+
+def save_fig(fig, filename_base):
+    png = OUT_DIR / f"{filename_base}.png"
+    pdf = OUT_DIR / f"{filename_base}.pdf"
+    fig.savefig(png, **SAVEFIG_KW)
+    fig.savefig(pdf, **SAVEFIG_KW)
+    print(f"[Saved] {png}")
+    print(f"[Saved] {pdf}")
+
+
+def haversine_m(lat1, lon1, lat2, lon2):
+    R = 6371000.0
+    lat1 = np.radians(lat1)
+    lon1 = np.radians(lon1)
+    lat2 = np.radians(lat2)
+    lon2 = np.radians(lon2)
+
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+
+    a = np.sin(dlat / 2.0) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2.0) ** 2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    return R * c
+
+
+def ensure_numeric(df, cols):
+    for c in cols:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def parse_bool_like(s):
+    if pd.isna(s):
+        return False
+    if isinstance(s, (bool, np.bool_)):
+        return bool(s)
+    s = str(s).strip().lower()
+    return s in {"1", "true", "t", "yes", "y", "on"}
+
+
+def parse_battery_pct_value(x):
+    if pd.isna(x):
+        return np.nan
+    if isinstance(x, (int, float, np.integer, np.floating)):
+        return float(x)
+
+    s = str(x).strip()
+    if not s:
+        return np.nan
+
+    s = s.replace("%", "")
+    m = re.search(r"-?\d+(\.\d+)?", s)
+    if m:
+        try:
+            return float(m.group())
+        except Exception:
+            return np.nan
+    return np.nan
+
+
+def find_main_excel(folder: Path):
+    files = list(folder.glob("*.xlsx")) + list(folder.glob("*.xls"))
+    if not files:
+        raise FileNotFoundError(f"No Excel file found in: {folder}")
+    files = sorted(files, key=lambda p: p.stat().st_size, reverse=True)
+    return files[0]
+
+
+def resolve_excel_path(root: Path, order: str, profile: str):
+    direct_xlsx = root / order / f"{profile}.xlsx"
+    direct_xls = root / order / f"{profile}.xls"
+
+    if direct_xlsx.exists():
+        return direct_xlsx
+    if direct_xls.exists():
+        return direct_xls
+
+    folder = root / order / profile
+    if folder.is_dir():
+        return find_main_excel(folder)
+
+    raise FileNotFoundError(
+        f"Excel file not found for order={order}, profile={profile}. "
+        f"Tried: {direct_xlsx}, {direct_xls}, and folder {folder}"
+    )
+
+
+def read_excel_all_sheets(excel_path: Path):
+    suffix = excel_path.suffix.lower()
+    if suffix == ".xlsx":
+        engine = "openpyxl"
+    elif suffix == ".xls":
+        engine = "xlrd"
+    else:
+        raise ValueError(f"Unsupported file type: {excel_path}")
+
+    xls = pd.ExcelFile(excel_path, engine=engine)
+    sheet_dict = {}
+    for s in xls.sheet_names:
+        sheet_dict[s] = pd.read_excel(excel_path, sheet_name=s, engine=engine)
+    return sheet_dict
+
+
+def choose_best_sheet(sheet_dict, order_name, profile_name, excel_path):
+    best_sheet_name = None
+    best_df = None
+    best_count = -1
+
+    for sheet_name, raw_df in sheet_dict.items():
+        tmp = raw_df.copy()
+
+        if "battery_pct" in tmp.columns:
+            cnt = tmp["battery_pct"].apply(parse_battery_pct_value).notna().sum()
+        else:
+            cnt = 0
+
+        if cnt > best_count:
+            best_count = cnt
+            best_sheet_name = sheet_name
+            best_df = raw_df
+
+    if best_df is None:
+        first_sheet = next(iter(sheet_dict.keys()))
+        best_sheet_name = first_sheet
+        best_df = sheet_dict[first_sheet]
+
+    return best_sheet_name, best_df
+
+
+def load_profile_excel(excel_path: Path, order_name: str, profile_name: str):
+    sheet_dict = read_excel_all_sheets(excel_path)
+    selected_sheet, df = choose_best_sheet(sheet_dict, order_name, profile_name, excel_path)
+    df = df.copy()
+
+    expected_cols = [
+        "timestamp", "elapsed_ms", "event", "mode", "intent",
+        "raw_provider", "raw_lat", "raw_lon", "raw_accuracy_m",
+        "released_lat", "released_lon", "release_offset_m",
+        "epsilon_used", "release_triggered", "raw_update_count",
+        "release_count", "gps_reference_count", "battery_pct",
+        "is_charging", "charge_plug", "device", "android_version", "note"
+    ]
+    missing = [c for c in expected_cols if c not in df.columns]
+    if missing:
+        print(f"[Warning] {excel_path} missing columns: {missing}")
+
+    numeric_cols = [
+        "elapsed_ms", "raw_lat", "raw_lon", "raw_accuracy_m",
+        "released_lat", "released_lon", "release_offset_m",
+        "epsilon_used", "raw_update_count", "release_count",
+        "gps_reference_count"
+    ]
+    df = ensure_numeric(df, numeric_cols)
+
+    if "battery_pct" in df.columns:
+        df["battery_pct"] = df["battery_pct"].apply(parse_battery_pct_value)
+    else:
+        df["battery_pct"] = np.nan
+
+    if "timestamp" in df.columns:
+        ts_num = pd.to_numeric(df["timestamp"], errors="coerce")
+        df["timestamp_parsed"] = pd.to_datetime(ts_num, unit="ms", errors="coerce")
+    else:
+        df["timestamp_parsed"] = pd.NaT
+
+    if "release_triggered" in df.columns:
+        df["release_triggered_bool"] = df["release_triggered"].apply(parse_bool_like)
+    else:
+        df["release_triggered_bool"] = False
+
+    if "is_charging" in df.columns:
+        df["is_charging_bool"] = df["is_charging"].apply(parse_bool_like)
+    else:
+        df["is_charging_bool"] = False
+
+    df["order"] = order_name
+    df["profile"] = profile_name
+    df["source_file"] = excel_path.name
+    df["selected_sheet"] = selected_sheet
+    return df
+
+
+def sort_by_best_time(df):
+    d = df.copy()
+
+    if "timestamp_parsed" in d.columns and d["timestamp_parsed"].notna().sum() >= 2:
+        if "elapsed_ms" in d.columns:
+            d = d.sort_values(["timestamp_parsed", "elapsed_ms"], na_position="last")
+        else:
+            d = d.sort_values(["timestamp_parsed"], na_position="last")
+        return d.reset_index(drop=True), "timestamp_parsed"
+
+    if "elapsed_ms" in d.columns and pd.to_numeric(d["elapsed_ms"], errors="coerce").notna().sum() >= 2:
+        d = d.sort_values(["elapsed_ms"], na_position="last")
+        return d.reset_index(drop=True), "elapsed_ms"
+
+    d = d.reset_index(drop=True)
+    return d, "row_order"
+
+
+def get_released_points(df):
+    d = df.copy()
+
+    if ONLY_RELEASED_POINTS and "release_triggered_bool" in d.columns:
+        d = d[d["release_triggered_bool"] == True].copy()
+
+    d = d.dropna(subset=["released_lat", "released_lon"]).copy()
+    d, _ = sort_by_best_time(d)
+    return d
+
+
+def get_gps_ground_truth_points(df):
+    d = df.copy()
+    d = d.dropna(subset=["raw_lat", "raw_lon"]).copy()
+    d, _ = sort_by_best_time(d)
+    return d
+
+
+def infer_duration_hours(df):
+    if len(df) < 2:
+        return np.nan
+
+    if "timestamp_parsed" in df.columns:
+        t = df["timestamp_parsed"].dropna()
+        if len(t) >= 2:
+            dur_s = (t.iloc[-1] - t.iloc[0]).total_seconds()
+            if dur_s > 0:
+                return dur_s / 3600.0
+
+    if "elapsed_ms" in df.columns:
+        vals = pd.to_numeric(df["elapsed_ms"], errors="coerce").dropna()
+        if len(vals) >= 2:
+            dur_ms = vals.iloc[-1] - vals.iloc[0]
+            if dur_ms > 0:
+                return dur_ms / 1000.0 / 3600.0
+
+    return np.nan
+
+
+def simple_linear_fit(x, y):
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    x = x[mask]
+    y = y[mask]
+    if len(x) < 2:
+        return None, None, None
+
+    coef = np.polyfit(x, y, 1)
+    slope, intercept = coef[0], coef[1]
+    y_pred = slope * x + intercept
+    ss_res = np.sum((y - y_pred) ** 2)
+    ss_tot = np.sum((y - np.mean(y)) ** 2)
+    r2 = np.nan if ss_tot == 0 else 1 - ss_res / ss_tot
+    return slope, intercept, r2
+
+
+def build_battery_fit_dataframe(df):
+    d = df.copy()
+
+    raw_batt_rows = int(d["battery_pct"].notna().sum()) if "battery_pct" in d.columns else 0
+
+    if "is_charging_bool" in d.columns:
+        d = d[d["is_charging_bool"] == False].copy()
+
+    non_charging_rows = len(d)
+
+    d = d.dropna(subset=["battery_pct"]).copy()
+    valid_battery_rows = len(d)
+
+    if len(d) < 2:
+        return d, {
+            "raw_batt_rows": raw_batt_rows,
+            "non_charging_rows": non_charging_rows,
+            "valid_battery_rows": valid_battery_rows,
+            "sort_basis": "none",
+            "time_basis": "none",
+            "reason": "fewer_than_2_valid_battery_points"
+        }
+
+    d, sort_basis = sort_by_best_time(d)
+
+    if "timestamp_parsed" in d.columns and d["timestamp_parsed"].notna().sum() >= 2:
+        t = d["timestamp_parsed"]
+        t0 = t.dropna().iloc[0]
+        d["time_h_from_start"] = (t - t0).dt.total_seconds() / 3600.0
+        time_basis = "timestamp_parsed"
+    elif "elapsed_ms" in d.columns and pd.to_numeric(d["elapsed_ms"], errors="coerce").notna().sum() >= 2:
+        em = pd.to_numeric(d["elapsed_ms"], errors="coerce")
+        t0 = em.dropna().iloc[0]
+        d["time_h_from_start"] = (em - t0) / 1000.0 / 3600.0
+        time_basis = "elapsed_ms"
+    else:
+        d["time_h_from_start"] = np.arange(len(d), dtype=float)
+        time_basis = "row_index"
+
+    d["time_h_from_start"] = pd.to_numeric(d["time_h_from_start"], errors="coerce")
+
+    return d, {
+        "raw_batt_rows": raw_batt_rows,
+        "non_charging_rows": non_charging_rows,
+        "valid_battery_rows": valid_battery_rows,
+        "sort_basis": sort_basis,
+        "time_basis": time_basis,
+        "reason": "ok"
+    }
+
+
+def compute_battery_metrics(df, bin_minutes=2):
+    d, meta = build_battery_fit_dataframe(df)
+
+    if len(d) < 2:
+        duration_h = infer_duration_hours(df)
+        return {
+            "start_battery": np.nan,
+            "end_battery": np.nan,
+            "battery_drop_pct": np.nan,
+            "duration_h": duration_h,
+            "drain_pct_per_h": np.nan,
+            "drain_method": "linear_fit_insufficient_data",
+            "raw_batt_rows": meta["raw_batt_rows"],
+            "non_charging_rows": meta["non_charging_rows"],
+            "valid_battery_rows": meta["valid_battery_rows"],
+            "battery_reason": meta["reason"],
+            "battery_sort_basis": meta["sort_basis"],
+            "battery_time_basis": meta["time_basis"],
+            "battery_slope": np.nan,
+            "battery_intercept": np.nan,
+            "battery_r2": np.nan,
+        }
+
+    x = d["time_h_from_start"].to_numpy(dtype=float)
+    y = d["battery_pct"].to_numpy(dtype=float)
+
+    slope, intercept, r2 = simple_linear_fit(x, y)
+
+    if slope is None:
+        duration_h = infer_duration_hours(d)
+        return {
+            "start_battery": float(y[0]) if len(y) else np.nan,
+            "end_battery": float(y[-1]) if len(y) else np.nan,
+            "battery_drop_pct": (float(y[0]) - float(y[-1])) if len(y) >= 2 else np.nan,
+            "duration_h": duration_h,
+            "drain_pct_per_h": np.nan,
+            "drain_method": "linear_fit_failed",
+            "raw_batt_rows": meta["raw_batt_rows"],
+            "non_charging_rows": meta["non_charging_rows"],
+            "valid_battery_rows": meta["valid_battery_rows"],
+            "battery_reason": "linear_fit_failed",
+            "battery_sort_basis": meta["sort_basis"],
+            "battery_time_basis": meta["time_basis"],
+            "battery_slope": np.nan,
+            "battery_intercept": np.nan,
+            "battery_r2": np.nan,
+        }
+
+    duration_h = np.nanmax(x) - np.nanmin(x) if len(x) >= 2 else np.nan
+    if not np.isfinite(duration_h) or duration_h <= 0:
+        duration_h = infer_duration_hours(d)
+
+    start_b_fit = intercept + slope * np.nanmin(x)
+    end_b_fit = intercept + slope * np.nanmax(x)
+    drop_fit = start_b_fit - end_b_fit
+    drain_rate = -slope
+
+    return {
+        "start_battery": float(start_b_fit),
+        "end_battery": float(end_b_fit),
+        "battery_drop_pct": float(drop_fit),
+        "duration_h": float(duration_h) if pd.notna(duration_h) else np.nan,
+        "drain_pct_per_h": float(drain_rate),
+        "drain_method": "linear_fit",
+        "raw_batt_rows": meta["raw_batt_rows"],
+        "non_charging_rows": meta["non_charging_rows"],
+        "valid_battery_rows": meta["valid_battery_rows"],
+        "battery_reason": meta["reason"],
+        "battery_sort_basis": meta["sort_basis"],
+        "battery_time_basis": meta["time_basis"],
+        "battery_slope": float(slope),
+        "battery_intercept": float(intercept),
+        "battery_r2": float(r2) if pd.notna(r2) else np.nan,
+    }
+
+
+def nearest_path_error_to_reference(query_lat, query_lon, ref_lats, ref_lons):
+    dists = haversine_m(query_lat, query_lon, ref_lats, ref_lons)
+    return float(np.min(dists))
+
+
+def compute_path_errors_to_gps_reference(all_runs):
+    point_rows = []
+    summary_rows = []
+
+    for order in ORDERS:
+        if (order, "gps") not in all_runs:
+            print(f"[Warning] Missing GPS run for {order}, skipping.")
+            continue
+
+        gps_df = get_gps_ground_truth_points(all_runs[(order, "gps")])
+
+        if len(gps_df) == 0:
+            print(f"[Warning] GPS raw ground-truth points empty in {order}, skipping.")
+            continue
+
+        gps_lats = gps_df["raw_lat"].to_numpy()
+        gps_lons = gps_df["raw_lon"].to_numpy()
+
+        for profile in EVAL_PROFILES:
+            if (order, profile) not in all_runs:
+                print(f"[Warning] Missing {profile} run for {order}, skipping.")
+                continue
+
+            cur_df = get_released_points(all_runs[(order, profile)])
+
+            if len(cur_df) == 0:
+                print(f"[Warning] No released points for {profile} in {order}.")
+                continue
+
+            errs = []
+            for _, row in cur_df.iterrows():
+                e = nearest_path_error_to_reference(
+                    row["released_lat"], row["released_lon"],
+                    gps_lats, gps_lons
+                )
+                errs.append(e)
+
+            cur_df = cur_df.copy()
+            cur_df["path_error_to_gps_ref_m"] = errs
+
+            for _, row in cur_df.iterrows():
+                point_rows.append({
+                    "order": order,
+                    "profile": profile,
+                    "elapsed_ms": row.get("elapsed_ms", np.nan),
+                    "timestamp": row.get("timestamp", None),
+                    "timestamp_parsed": row.get("timestamp_parsed", pd.NaT),
+                    "released_lat": row["released_lat"],
+                    "released_lon": row["released_lon"],
+                    "path_error_to_gps_ref_m": row["path_error_to_gps_ref_m"],
+                    "release_offset_m": row.get("release_offset_m", np.nan),
+                    "raw_accuracy_m": row.get("raw_accuracy_m", np.nan),
+                })
+
+            arr = np.array(errs, dtype=float)
+            summary_rows.append({
+                "order": order,
+                "profile": profile,
+                "n_released": len(arr),
+                "mean_path_error_m": float(np.nanmean(arr)) if len(arr) > 0 else np.nan,
+                "median_path_error_m": float(np.nanmedian(arr)) if len(arr) > 0 else np.nan,
+                "p90_path_error_m": float(np.nanpercentile(arr, 90)) if len(arr) > 0 else np.nan,
+                "p95_path_error_m": float(np.nanpercentile(arr, 95)) if len(arr) > 0 else np.nan,
+            })
+
+    point_df = pd.DataFrame(point_rows)
+    summary_df = pd.DataFrame(summary_rows)
+    return point_df, summary_df
+
+
+def ecdf(x):
+    x = np.array(x, dtype=float)
+    x = x[np.isfinite(x)]
+    x = np.sort(x)
+    if len(x) == 0:
+        return np.array([]), np.array([])
+    y = np.arange(1, len(x) + 1) / len(x)
+    return x, y
+
+
+def all_xy_bounds(dfs_xy_pairs):
+    xs = []
+    ys = []
+    for df, xcol, ycol in dfs_xy_pairs:
+        if df is None or len(df) == 0:
+            continue
+        tmp = df[[xcol, ycol]].dropna()
+        if len(tmp) == 0:
+            continue
+        xs.append(tmp[xcol].to_numpy())
+        ys.append(tmp[ycol].to_numpy())
+
+    if not xs or not ys:
+        return None
+
+    x_all = np.concatenate(xs)
+    y_all = np.concatenate(ys)
+
+    xmin, xmax = np.min(x_all), np.max(x_all)
+    ymin, ymax = np.min(y_all), np.max(y_all)
+
+    xpad = max((xmax - xmin) * 0.08, 0.0002)
+    ypad = max((ymax - ymin) * 0.08, 0.0002)
+
+    return xmin - xpad, xmax + xpad, ymin - ypad, ymax + ypad
+
+
+# =========================================================
+# 2. Load all runs
+# =========================================================
+
+all_runs = {}
+run_summary_rows = []
+
+for order in ORDERS:
+    for profile in PROFILES:
+        excel_path = resolve_excel_path(ROOT, order, profile)
+        df = load_profile_excel(excel_path, order, profile)
+        all_runs[(order, profile)] = df
+
+        batt = compute_battery_metrics(df, bin_minutes=2)
+
+        if profile == "gps":
+            points_for_count = get_gps_ground_truth_points(df)
+        else:
+            points_for_count = get_released_points(df)
+
+        run_summary_rows.append({
+            "order": order,
+            "profile": profile,
+            "source_file": excel_path.name,
+            "selected_sheet": df["selected_sheet"].iloc[0] if "selected_sheet" in df.columns and len(df) else None,
+            "n_rows_total": len(df),
+            "n_points_used": len(points_for_count),
+            "start_battery": batt["start_battery"],
+            "end_battery": batt["end_battery"],
+            "battery_drop_pct": batt["battery_drop_pct"],
+            "duration_h": batt["duration_h"],
+            "drain_pct_per_h": batt["drain_pct_per_h"],
+            "drain_method": batt["drain_method"],
+            "battery_slope": batt["battery_slope"],
+            "battery_intercept": batt["battery_intercept"],
+            "battery_r2": batt["battery_r2"],
+            "raw_batt_rows": batt["raw_batt_rows"],
+            "non_charging_rows": batt["non_charging_rows"],
+            "valid_battery_rows": batt["valid_battery_rows"],
+            "battery_reason": batt["battery_reason"],
+            "battery_sort_basis": batt["battery_sort_basis"],
+            "battery_time_basis": batt["battery_time_basis"],
+            "median_release_offset_m": (
+                round(pd.to_numeric(df["release_offset_m"], errors="coerce").median(), 2)
+                if "release_offset_m" in df.columns and profile != "gps"
+                and pd.notna(pd.to_numeric(df["release_offset_m"], errors="coerce").median())
+                else np.nan
+            ),
+            "median_raw_accuracy_m": (
+                round(pd.to_numeric(df["raw_accuracy_m"], errors="coerce").median(), 2)
+                if "raw_accuracy_m" in df.columns
+                and pd.notna(pd.to_numeric(df["raw_accuracy_m"], errors="coerce").median())
+                else np.nan
+            ),
+        })
+
+run_summary_df = pd.DataFrame(run_summary_rows)
+
+for c in [
+    "start_battery", "end_battery", "battery_drop_pct", "drain_pct_per_h",
+    "battery_slope", "battery_intercept", "battery_r2"
+]:
+    if c in run_summary_df.columns:
+        run_summary_df[c] = run_summary_df[c].round(2)
+
+run_summary_df.to_excel(OUT_DIR / "run_level_summary.xlsx", index=False)
+
+
+# =========================================================
+# 2.5 Export fitted battery points
+# =========================================================
+
+battery_fit_export_rows = []
+
+for order in ORDERS:
+    for profile in PROFILES:
+        df = all_runs[(order, profile)]
+        fit_df, meta = build_battery_fit_dataframe(df)
+
+        if len(fit_df) >= 2:
+            x = fit_df["time_h_from_start"].to_numpy(dtype=float)
+            y = fit_df["battery_pct"].to_numpy(dtype=float)
+            slope, intercept, r2 = simple_linear_fit(x, y)
+
+            if slope is not None:
+                fit_df = fit_df.copy()
+                fit_df["battery_fitted"] = slope * fit_df["time_h_from_start"] + intercept
+                fit_df["battery_residual"] = fit_df["battery_pct"] - fit_df["battery_fitted"]
+
+                export_cols = [
+                    "order", "profile", "time_h_from_start", "battery_pct",
+                    "battery_fitted", "battery_residual", "timestamp",
+                    "timestamp_parsed", "elapsed_ms", "is_charging_bool"
+                ]
+                for c in export_cols:
+                    if c not in fit_df.columns:
+                        fit_df[c] = np.nan
+
+                battery_fit_export_rows.append(fit_df[export_cols])
+
+if battery_fit_export_rows:
+    battery_fit_export_df = pd.concat(battery_fit_export_rows, ignore_index=True)
+else:
+    battery_fit_export_df = pd.DataFrame(columns=[
+        "order", "profile", "time_h_from_start", "battery_pct",
+        "battery_fitted", "battery_residual", "timestamp",
+        "timestamp_parsed", "elapsed_ms", "is_charging_bool"
+    ])
+
+battery_fit_export_df.to_excel(OUT_DIR / "battery_linear_fit_points.xlsx", index=False)
+
+
+# =========================================================
+# 3. Compute path errors to GPS reference
+# =========================================================
+
+point_errors_df, path_summary_df = compute_path_errors_to_gps_reference(all_runs)
+
+if not point_errors_df.empty:
+    for c in ["path_error_to_gps_ref_m", "release_offset_m", "raw_accuracy_m"]:
+        if c in point_errors_df.columns:
+            point_errors_df[c] = point_errors_df[c].round(2)
+
+if not path_summary_df.empty:
+    for c in ["mean_path_error_m", "median_path_error_m", "p90_path_error_m", "p95_path_error_m"]:
+        if c in path_summary_df.columns:
+            path_summary_df[c] = path_summary_df[c].round(2)
+
+point_errors_df.to_excel(OUT_DIR / "point_level_path_errors_to_gps_reference.xlsx", index=False)
+path_summary_df.to_excel(OUT_DIR / "path_error_summary_by_order_profile.xlsx", index=False)
+
+if point_errors_df.empty:
+    print("[Warning] point_errors_df is empty.")
+    print("Check whether:")
+    print("  1) gps has raw_lat/raw_lon")
+    print("  2) baseline/burst have released_lat/released_lon")
+    print("  3) release_triggered is parsed correctly")
+
+
+# =========================================================
+# 4. Figure 1: Battery drain comparison
+# =========================================================
+
+fig, ax = plt.subplots(figsize=(8.6, 5.4))
+
+x = np.arange(len(ORDERS))
+width = 0.22
+offsets = {"baseline": -width, "burst": 0.0, "gps": width}
+
+for profile in PROFILES:
+    vals = []
+    for order in ORDERS:
+        row = run_summary_df[
+            (run_summary_df["order"] == order) &
+            (run_summary_df["profile"] == profile)
+        ]
+        vals.append(row["drain_pct_per_h"].iloc[0] if len(row) else np.nan)
+
+    bars = ax.bar(
+        x + offsets[profile],
+        vals,
+        width=width * 0.88,
+        color=COLORS[profile],
+        alpha=0.95,
+        label=profile.capitalize(),
+        edgecolor="white",
+        linewidth=0.9
+    )
+
+    for rect, v in zip(bars, vals):
+        if pd.notna(v):
+            ax.text(
+                rect.get_x() + rect.get_width() / 2,
+                rect.get_height(),
+                f"{v:.2f}",
+                ha="center",
+                va="bottom",
+                fontsize=9,
+                fontweight="bold"
+            )
+
+ax.set_xticks(x)
+ax.set_xticklabels([o.capitalize() for o in ORDERS], fontweight="bold")
+ax.set_ylabel("Battery drain rate from linear fit (% / h)", fontweight="bold")
+ax.set_xlabel("Run", fontweight="bold")
+ax.set_title("Battery drain across walking runs", pad=10, fontweight="bold")
+ax.legend(loc="upper left", ncol=3, frameon=False)
+style_axis(ax, ygrid=True)
+
+all_vals = run_summary_df["drain_pct_per_h"].dropna().to_numpy()
+if len(all_vals) > 0:
+    ymax = max(all_vals.max() * 1.18, 0.5)
+    ax.set_ylim(0, ymax)
+
+fig.subplots_adjust(left=0.12, right=0.98, bottom=0.15, top=0.90)
+save_fig(fig, "figure1_battery_drain_grouped_bar_walking")
+plt.close(fig)
+
+
+# =========================================================
+# 4b. Figure 1b: Battery linear fit by run
+# =========================================================
+
+fig, axes = plt.subplots(3, 3, figsize=(14, 11))
+fig.subplots_adjust(left=0.06, right=0.99, bottom=0.07, top=0.92, wspace=0.22, hspace=0.30)
+
+for i, order in enumerate(ORDERS):
+    for j, profile in enumerate(PROFILES):
+        ax = axes[i, j]
+        df = all_runs[(order, profile)]
+        fit_df, meta = build_battery_fit_dataframe(df)
+
+        ax.set_title(f"{order.capitalize()} · {profile.capitalize()}", fontweight="bold")
+
+        if len(fit_df) < 2:
+            ax.text(
+                0.5, 0.5, "Insufficient battery data",
+                ha="center", va="center",
+                transform=ax.transAxes,
+                fontsize=10, fontweight="bold"
+            )
+            style_axis(ax, ygrid=True)
+            continue
+
+        x_fit = fit_df["time_h_from_start"].to_numpy(dtype=float)
+        y_fit = fit_df["battery_pct"].to_numpy(dtype=float)
+
+        slope, intercept, r2 = simple_linear_fit(x_fit, y_fit)
+
+        ax.scatter(
+            x_fit, y_fit,
+            s=18, alpha=0.70,
+            color=COLORS[profile],
+            edgecolor="white", linewidth=0.4
+        )
+
+        if slope is not None:
+            xs = np.linspace(np.nanmin(x_fit), np.nanmax(x_fit), 100)
+            ys = slope * xs + intercept
+            ax.plot(xs, ys, color="black", linewidth=2.0)
+
+            r2_str = "nan" if pd.isna(r2) else f"{r2:.2f}"
+            drain_rate = -slope
+            ax.text(
+                0.03, 0.97,
+                f"Slope = {slope:.3f}\nDrain = {drain_rate:.3f} %/h\nR² = {r2_str}",
+                transform=ax.transAxes,
+                ha="left", va="top",
+                fontsize=9, fontweight="bold",
+                bbox=dict(facecolor="white", alpha=0.75, edgecolor="none")
+            )
+
+        if i == 2:
+            ax.set_xlabel("Time from start (h)", fontweight="bold")
+        else:
+            ax.set_xlabel("")
+
+        if j == 0:
+            ax.set_ylabel("Battery (%)", fontweight="bold")
+        else:
+            ax.set_ylabel("")
+
+        style_axis(ax, ygrid=True)
+
+fig.suptitle("Battery linear fit for each walking run", fontsize=14, fontweight="bold")
+save_fig(fig, "figure1b_battery_linear_fit_grid_walking")
+plt.close(fig)
+
+
+# =========================================================
+# 5. Figure 2: Path error distribution
+# =========================================================
+
+fig, ax = plt.subplots(figsize=(9.0, 5.8))
+
+tick_positions = []
+tick_labels = []
+base_centers = np.arange(len(ORDERS)) * 2.8
+delta = 0.34
+
+baseline_arrays = []
+baseline_positions = []
+burst_arrays = []
+burst_positions = []
+
+for i, order in enumerate(ORDERS):
+    center = base_centers[i]
+    tick_positions.append(center)
+    tick_labels.append(order.capitalize())
+
+    vals_base = point_errors_df.loc[
+        (point_errors_df["order"] == order) & (point_errors_df["profile"] == "baseline"),
+        "path_error_to_gps_ref_m"
+    ].dropna().to_numpy()
+
+    vals_burst = point_errors_df.loc[
+        (point_errors_df["order"] == order) & (point_errors_df["profile"] == "burst"),
+        "path_error_to_gps_ref_m"
+    ].dropna().to_numpy()
+
+    if len(vals_base) > 0:
+        baseline_arrays.append(vals_base)
+        baseline_positions.append(center - delta)
+
+    if len(vals_burst) > 0:
+        burst_arrays.append(vals_burst)
+        burst_positions.append(center + delta)
+
+valid_any = (len(baseline_arrays) + len(burst_arrays)) > 0
+
+if valid_any:
+    if len(baseline_arrays) > 0:
+        vp1 = ax.violinplot(
+            baseline_arrays,
+            positions=baseline_positions,
+            widths=0.46,
+            showmeans=False,
+            showmedians=False,
+            showextrema=False
+        )
+        for body in vp1["bodies"]:
+            body.set_facecolor(COLORS["violin_baseline"])
+            body.set_edgecolor("none")
+            body.set_alpha(0.85)
+
+        ax.boxplot(
+            baseline_arrays,
+            positions=baseline_positions,
+            widths=0.18,
+            patch_artist=True,
+            showfliers=False,
+            showcaps=False,
+            medianprops=dict(color="white", linewidth=1.1),
+            whiskerprops=dict(color=COLORS["baseline"], linewidth=1.0),
+            boxprops=dict(facecolor=COLORS["baseline"], edgecolor=COLORS["baseline"], linewidth=1.0)
+        )
+
+    if len(burst_arrays) > 0:
+        vp2 = ax.violinplot(
+            burst_arrays,
+            positions=burst_positions,
+            widths=0.46,
+            showmeans=False,
+            showmedians=False,
+            showextrema=False
+        )
+        for body in vp2["bodies"]:
+            body.set_facecolor(COLORS["violin_burst"])
+            body.set_edgecolor("none")
+            body.set_alpha(0.90)
+
+        ax.boxplot(
+            burst_arrays,
+            positions=burst_positions,
+            widths=0.18,
+            patch_artist=True,
+            showfliers=False,
+            showcaps=False,
+            medianprops=dict(color="white", linewidth=1.1),
+            whiskerprops=dict(color=COLORS["burst"], linewidth=1.0),
+            boxprops=dict(facecolor=COLORS["burst"], edgecolor=COLORS["burst"], linewidth=1.0)
+        )
+else:
+    ax.text(0.5, 0.5, "No valid path-error data", ha="center", va="center", transform=ax.transAxes, fontweight="bold")
+
+ax.set_xticks(tick_positions)
+ax.set_xticklabels(tick_labels, fontweight="bold")
+ax.set_xlabel("Run", fontweight="bold")
+ax.set_ylabel("Released-point error to GPS reference (m)", fontweight="bold")
+ax.set_title("Path-error distribution by run", pad=10, fontweight="bold")
+style_axis(ax, ygrid=True)
+
+legend_handles = [
+    Patch(facecolor=COLORS["baseline"], edgecolor="none", label="Baseline"),
+    Patch(facecolor=COLORS["burst"], edgecolor="none", label="Burst"),
+]
+ax.legend(handles=legend_handles, loc="upper right", ncol=2, frameon=False)
+
+fig.subplots_adjust(left=0.12, right=0.98, bottom=0.15, top=0.90)
+save_fig(fig, "figure2_fused_orderwise_boxplot_path_error_walking")
+plt.close(fig)
+
+
+# =========================================================
+# 6. Figure 3: ECDF
+# =========================================================
+
+fig, ax = plt.subplots(figsize=(8.6, 5.5))
+
+linestyles = {
+    "baseline": "-",
+    "burst": "--",
+}
+
+has_curve = False
+for order in ORDERS:
+    for profile in EVAL_PROFILES:
+        vals = point_errors_df.loc[
+            (point_errors_df["order"] == order) &
+            (point_errors_df["profile"] == profile),
+            "path_error_to_gps_ref_m"
+        ].dropna().to_numpy()
+
+        xs, ys = ecdf(vals)
+        if len(xs) > 0:
+            ax.plot(
+                xs, ys,
+                label=f"{order.capitalize()} - {profile.capitalize()}",
+                color=COLORS[order],
+                linestyle=linestyles[profile],
+                linewidth=2.1
+            )
+            has_curve = True
+
+if not has_curve:
+    ax.text(0.5, 0.5, "No valid ECDF data", ha="center", va="center", transform=ax.transAxes, fontweight="bold")
+
+ax.set_xlabel("Released-point error to GPS reference (m)", fontweight="bold")
+ax.set_ylabel("Empirical CDF", fontweight="bold")
+ax.set_title("ECDF of released-point error", pad=10, fontweight="bold")
+ax.set_ylim(0, 1.01)
+style_axis(ax, ygrid=True)
+
+if has_curve:
+    ax.legend(frameon=False, ncol=2, loc="lower right")
+
+fig.subplots_adjust(left=0.12, right=0.98, bottom=0.15, top=0.90)
+save_fig(fig, "figure3_ecdf_fused_all_orders_walking")
+plt.close(fig)
+
+
+# =========================================================
+# 7. Figure 4: Order-wise median path error
+# =========================================================
+
+fig, ax = plt.subplots(figsize=(8.2, 5.2))
+
+x = np.arange(len(ORDERS))
+width = 0.34
+offsets = {"baseline": -width / 2, "burst": width / 2}
+
+for profile in EVAL_PROFILES:
+    vals = []
+    xs = []
+    for idx, order in enumerate(ORDERS):
+        row = path_summary_df[
+            (path_summary_df["order"] == order) &
+            (path_summary_df["profile"] == profile)
+        ]
+        val = row["median_path_error_m"].iloc[0] if len(row) else np.nan
+        vals.append(val)
+        xs.append(x[idx] + offsets[profile])
+
+    ax.bar(
+        xs,
+        vals,
+        width=width * 0.92,
+        color=COLORS[profile],
+        alpha=0.93,
+        label=profile.capitalize(),
+        edgecolor="white",
+        linewidth=0.8
+    )
+
+    for xi, yi in zip(xs, vals):
+        if pd.notna(yi):
+            ax.text(
+                xi, yi + 0.01 * max(1, np.nanmax(vals) if np.isfinite(np.nanmax(vals)) else 1),
+                f"{yi:.2f}",
+                ha="center", va="bottom",
+                fontsize=9, fontweight="bold"
+            )
+
+ax.set_xticks(x)
+ax.set_xticklabels([o.capitalize() for o in ORDERS], fontweight="bold")
+ax.set_xlabel("Run", fontweight="bold")
+ax.set_ylabel("Median released-point error (m)", fontweight="bold")
+ax.set_title("Order-wise median path error", pad=10, fontweight="bold")
+style_axis(ax, ygrid=True)
+ax.legend(loc="upper right", frameon=False)
+
+fig.subplots_adjust(left=0.12, right=0.98, bottom=0.15, top=0.90)
+save_fig(fig, "figure4_orderwise_median_path_error_walking")
+plt.close(fig)
+
+
+# =========================================================
+# 8. Figure 5a: P90 heatmap
+# =========================================================
+
+pivot = path_summary_df.pivot(index="order", columns="profile", values="p90_path_error_m")
+pivot = pivot.reindex(index=ORDERS, columns=EVAL_PROFILES)
+
+fig, ax = plt.subplots(figsize=(8.0, 4.8))
+arr = pivot.to_numpy(dtype=float)
+
+if np.isfinite(arr).any():
+    im = ax.imshow(arr, cmap="YlGnBu", aspect="auto")
+    cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Meters", fontweight="bold")
+    for t in cbar.ax.get_yticklabels():
+        t.set_fontweight("bold")
+
+    vmax = np.nanmax(arr)
+    for i in range(arr.shape[0]):
+        for j in range(arr.shape[1]):
+            val = arr[i, j]
+            text = "NA" if not np.isfinite(val) else f"{val:.2f}"
+            color = "black" if (not np.isfinite(val) or val < vmax * 0.65) else "white"
+            ax.text(
+                j, i, text,
+                ha="center", va="center",
+                fontsize=10, color=color,
+                fontweight="bold"
+            )
+else:
+    ax.text(0.5, 0.5, "No valid data", ha="center", va="center", transform=ax.transAxes, fontweight="bold")
+
+ax.set_xticks(np.arange(len(EVAL_PROFILES)))
+ax.set_xticklabels([p.capitalize() for p in EVAL_PROFILES], fontweight="bold")
+ax.set_yticks(np.arange(len(ORDERS)))
+ax.set_yticklabels([o.capitalize() for o in ORDERS], fontweight="bold")
+ax.set_title("P90 Path Error Heatmap", fontweight="bold")
+ax.set_xlabel("Profile", fontweight="bold")
+ax.set_ylabel("Run order", fontweight="bold")
+ax.grid(False)
+make_all_text_bold(ax)
+
+fig.subplots_adjust(left=0.12, right=0.92, bottom=0.16, top=0.88)
+save_fig(fig, "figure5_heatmap_p90_path_error_walking")
+plt.close(fig)
+
+
+# =========================================================
+# 9. Figure 5b: Trajectory reconstruction
+# =========================================================
+
+fig, axes = plt.subplots(1, 3, figsize=(17.2, 5.6), sharex=False, sharey=False)
+
+for ax, order in zip(axes, ORDERS):
+    gps_df = get_gps_ground_truth_points(all_runs[(order, "gps")])
+    baseline_df = get_released_points(all_runs[(order, "baseline")])
+    burst_df = get_released_points(all_runs[(order, "burst")])
+
+    if len(gps_df) > 0:
+        ax.plot(
+            gps_df["raw_lon"], gps_df["raw_lat"],
+            color=COLORS["gt"], linewidth=2.4, alpha=0.95, label="GPS reference", zorder=3
+        )
+        ax.scatter(
+            gps_df["raw_lon"], gps_df["raw_lat"],
+            s=10, color=COLORS["gt"], alpha=0.55, zorder=3
+        )
+
+    if len(baseline_df) > 0:
+        ax.plot(
+            baseline_df["released_lon"], baseline_df["released_lat"],
+            color=COLORS["baseline"], linewidth=1.8, alpha=0.92, label="Baseline", zorder=2
+        )
+        ax.scatter(
+            baseline_df["released_lon"], baseline_df["released_lat"],
+            s=16, color=COLORS["baseline"], alpha=0.75, zorder=2
+        )
+
+    if len(burst_df) > 0:
+        ax.plot(
+            burst_df["released_lon"], burst_df["released_lat"],
+            color=COLORS["burst"], linewidth=1.8, alpha=0.92, label="Burst", zorder=2
+        )
+        ax.scatter(
+            burst_df["released_lon"], burst_df["released_lat"],
+            s=16, color=COLORS["burst"], alpha=0.78, zorder=2
+        )
+
+    if len(gps_df) > 0:
+        ax.scatter(
+            gps_df["raw_lon"].iloc[0], gps_df["raw_lat"].iloc[0],
+            s=56, marker="o", color="white", edgecolor="black", linewidth=1.0, zorder=5
+        )
+        ax.scatter(
+            gps_df["raw_lon"].iloc[-1], gps_df["raw_lat"].iloc[-1],
+            s=64, marker="s", color="white", edgecolor="black", linewidth=1.0, zorder=5
+        )
+
+    bounds = all_xy_bounds([
+        (gps_df, "raw_lon", "raw_lat"),
+        (baseline_df, "released_lon", "released_lat"),
+        (burst_df, "released_lon", "released_lat"),
+    ])
+    if bounds is not None:
+        xmin, xmax, ymin, ymax = bounds
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymin, ymax)
+
+    ax.set_title(order.capitalize(), pad=8, fontweight="bold")
+    ax.set_xlabel("Longitude", fontweight="bold")
+    if ax is axes[0]:
+        ax.set_ylabel("Latitude", fontweight="bold")
+
+    ax.grid(False)
+    ax.spines["left"].set_color("#444444")
+    ax.spines["bottom"].set_color("#444444")
+    ax.spines["left"].set_linewidth(0.9)
+    ax.spines["bottom"].set_linewidth(0.9)
+    ax.tick_params(axis="both", width=0.8, length=3.2, color="#444444")
+    make_all_text_bold(ax)
+
+legend_elements = [
+    Line2D([0], [0], color=COLORS["gt"], lw=2.4, label="GPS reference"),
+    Line2D([0], [0], color=COLORS["baseline"], lw=1.8, label="Baseline"),
+    Line2D([0], [0], color=COLORS["burst"], lw=1.8, label="Burst"),
+    Line2D([0], [0], marker="o", color="w", markerfacecolor="white",
+           markeredgecolor="black", markersize=7, label="Start"),
+    Line2D([0], [0], marker="s", color="w", markerfacecolor="white",
+           markeredgecolor="black", markersize=7, label="End"),
+]
+
+fig.legend(
+    handles=legend_elements,
+    loc="upper center",
+    ncol=5,
+    frameon=False,
+    bbox_to_anchor=(0.5, 1.02)
+)
+fig.suptitle("Trajectory reconstruction across the three walking runs", y=1.06, fontsize=15, fontweight="bold")
+fig.subplots_adjust(left=0.06, right=0.99, bottom=0.14, top=0.80, wspace=0.20)
+
+save_fig(fig, "figure5_trajectory_reconstruction_all_points")
+plt.close(fig)
+
+
+# =========================================================
+# 10. Overall summary
+# =========================================================
+
+if not point_errors_df.empty:
+    overall_error_summary = (
+        point_errors_df.groupby("profile")["path_error_to_gps_ref_m"]
+        .agg(["count", "mean", "median", lambda s: np.nanpercentile(s, 90)])
+        .reset_index()
+    )
+    overall_error_summary.columns = ["profile", "count", "mean_m", "median_m", "p90_m"]
+    for c in ["mean_m", "median_m", "p90_m"]:
+        overall_error_summary[c] = overall_error_summary[c].round(2)
+else:
+    overall_error_summary = pd.DataFrame(columns=["profile", "count", "mean_m", "median_m", "p90_m"])
+
+overall_error_summary.to_excel(OUT_DIR / "overall_error_summary_by_profile.xlsx", index=False)
+
+battery_debug_df = run_summary_df[[
+    "order", "profile", "source_file", "selected_sheet",
+    "n_rows_total", "raw_batt_rows", "non_charging_rows", "valid_battery_rows",
+    "start_battery", "end_battery", "battery_drop_pct",
+    "duration_h", "drain_pct_per_h", "drain_method",
+    "battery_slope", "battery_intercept", "battery_r2",
+    "battery_reason", "battery_sort_basis", "battery_time_basis"
+]].copy()
+
+for c in [
+    "start_battery", "end_battery", "battery_drop_pct", "drain_pct_per_h",
+    "battery_slope", "battery_intercept", "battery_r2"
+]:
+    if c in battery_debug_df.columns:
+        battery_debug_df[c] = battery_debug_df[c].round(2)
+
+battery_debug_df.to_excel(OUT_DIR / "battery_debug_summary.xlsx", index=False)
+
+print("\n===== Battery debug summary =====")
+print(battery_debug_df.to_string(index=False))
+
+print("\n===== Path error summary by order/profile =====")
+if path_summary_df.empty:
+    print("No valid path error summary data.")
+else:
+    print(path_summary_df.to_string(index=False))
+
+print("\n===== Overall path error summary =====")
+if overall_error_summary.empty:
+    print("No valid overall error summary data.")
+else:
+    print(overall_error_summary.to_string(index=False))
+
+print(f"\nAll outputs saved to:\n{OUT_DIR}")
