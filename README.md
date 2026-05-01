@@ -11,9 +11,6 @@ The experiments in the paper are organized in the following order:
 4. **Sequential trajectory recovery**
 5. **Sensitivity**
 
-At the current stage, this repository includes runnable code for **Experiments 2--5**. The code and data for **Main real-device deployment** are organized locally as **`Main real-device deployment code`** and **`data/experiment/data`**, and the README below reflects that naming.
-
----
 
 ## Quick start
 
